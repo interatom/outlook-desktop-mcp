@@ -24,6 +24,7 @@ from outlook_desktop_mcp.tools._folder_constants import (
     OL_MAIL_ITEM,
     OL_APPOINTMENT_ITEM,
     OL_FOLDER_CALENDAR,
+    OL_FOLDER_DRAFTS,
     OL_FOLDER_TASKS,
     OL_MEETING,
     OL_MEETING_CANCELED,
@@ -687,12 +688,14 @@ async def reply_email(
     entry_id: str,
     body: str,
     reply_all: bool = False,
+    save_as_draft: bool = False,
     account: str = "",
 ) -> str:
     """Reply to an email in Outlook.
 
     Creates and sends a reply, preserving the original message thread.
     Use reply_all=True to reply to all recipients (sender + CC list).
+    Use save_as_draft=True to save the reply as a draft instead of sending.
 
     Args:
         entry_id: The unique Outlook EntryID of the email to reply to.
@@ -700,13 +703,15 @@ async def reply_email(
             in the email thread.
         reply_all: If true, reply to all recipients (sender + all CC/To).
             If false (default), reply only to the sender.
+        save_as_draft: If true, save the reply to Drafts instead of sending.
+            Default false (sends immediately).
         account: Optional. Account display name (or substring). Only needed
             if entry_id is ambiguous across stores.
 
     Returns:
-        Confirmation indicating the reply was sent, or an error.
+        Confirmation the reply was sent, or JSON with entry_id if saved as draft.
     """
-    def _reply(outlook, namespace, entry_id, body, reply_all, account):
+    def _reply(outlook, namespace, entry_id, body, reply_all, save_as_draft, account):
         if account:
             store = _require_store(namespace, account)
             item = namespace.GetItemFromID(entry_id, store.StoreID)
@@ -717,11 +722,14 @@ async def reply_email(
         subject = item.Subject
         reply_item = item.ReplyAll() if reply_all else item.Reply()
         reply_item.Body = body + "\n\n" + reply_item.Body
+        if save_as_draft:
+            reply_item.Save()
+            return json.dumps({"entry_id": reply_item.EntryID, "subject": reply_item.Subject})
         reply_item.Send()
         return f"Reply sent to '{subject}' (reply_all={reply_all})"
 
     try:
-        return await bridge.call(_reply, entry_id, body, reply_all, account)
+        return await bridge.call(_reply, entry_id, body, reply_all, save_as_draft, account)
     except Exception as e:
         return f"Error replying to email: {format_com_error(e)}"
 
