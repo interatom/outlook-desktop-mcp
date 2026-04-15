@@ -15,6 +15,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
 
+# Recipient for the send_email test. Set MCP_TEST_RECIPIENT in your shell
+# to an address you control. Default is an RFC 2606 undeliverable address
+# so no external email is sent during automated testing.
+_TEST_RECIPIENT = os.environ.get("MCP_TEST_RECIPIENT", "outlook-mcp-test@example.invalid")
+
 
 def log(msg):
     print(msg, file=sys.stderr, flush=True)
@@ -24,12 +29,12 @@ async def run_tests():
     from mcp.client.stdio import stdio_client, StdioServerParameters
     from mcp.client.session import ClientSession
 
-    python_exe = r"C:\Development_Local\outlook-desktop-mcp\.venv\Scripts\python.exe"
+    python_exe = sys.executable  # use the same venv that's running this script
 
     server_params = StdioServerParameters(
         command=python_exe,
         args=["-m", "outlook_desktop_mcp.server"],
-        cwd=r"C:\Development_Local\outlook-desktop-mcp",
+        cwd=os.path.join(os.path.dirname(__file__), ".."),
     )
 
     log("=" * 60)
@@ -139,7 +144,7 @@ async def run_tests():
             log("\n--- Test 6: send_email ---")
             try:
                 result = await session.call_tool("send_email", {
-                    "to": "user@example.com",
+                    "to": _TEST_RECIPIENT,
                     "subject": "Outlook Desktop MCP - Phase 3 MCP Test",
                     "body": "Sent through the MCP server via stdio. If you see this, the MCP layer works!",
                 })
@@ -168,6 +173,38 @@ async def run_tests():
                 log("  PASS")
             except Exception as e:
                 log(f"  FAIL: {e}")
+
+            # ----- Test 8: reply_email save_as_draft -----
+            total += 1
+            log("\n--- Test 8: reply_email (save_as_draft) ---")
+            draft_entry_id = None
+            try:
+                assert first_entry_id, "No entry_id from previous test"
+                result = await session.call_tool("reply_email", {
+                    "entry_id": first_entry_id,
+                    "body": "MCP draft reply test — please ignore",
+                    "save_as_draft": True,
+                })
+                content = result.content[0].text
+                draft = json.loads(content)
+                draft_entry_id = draft.get("entry_id")
+                log(f"  Draft entry_id: {(draft_entry_id or '')[:40]}...")
+                assert draft_entry_id, "Expected entry_id in response"
+                passed += 1
+                log("  PASS")
+            except Exception as e:
+                log(f"  FAIL: {e}")
+            finally:
+                # Clean up: move draft to Deleted Items so Drafts folder stays clean
+                if draft_entry_id:
+                    try:
+                        await session.call_tool("move_email", {
+                            "entry_id": draft_entry_id,
+                            "target_folder": "deleted",
+                        })
+                        log("  (draft cleaned up)")
+                    except Exception:
+                        pass  # best-effort cleanup
 
     log("")
     log("=" * 60)
