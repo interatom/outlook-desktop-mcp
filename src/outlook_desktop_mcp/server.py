@@ -36,6 +36,7 @@ from outlook_desktop_mcp.tools._folder_constants import (
     OL_TASK_COMPLETE,
     TASK_STATUS_NAMES,
     IMPORTANCE_NAMES,
+    OL_FLAG_MARKED,
 )
 from outlook_desktop_mcp.utils.formatting import (
     format_email_summary,
@@ -526,7 +527,83 @@ async def mark_as_unread(entry_id: str, account: str = "") -> str:
 
 
 # =====================================================================
-# TOOL 6: move_email
+# TOOL 6: set_flag / clear_flag
+# =====================================================================
+
+@mcp.tool()
+async def set_flag(entry_id: str, account: str = "") -> str:
+    """Flag an email for follow-up in Outlook.
+
+    Sets the follow-up flag on the specified email (equivalent to clicking
+    the flag icon in Outlook). Use clear_flag to remove it.
+
+    Args:
+        entry_id: The unique Outlook EntryID of the email. Get this from
+            list_emails or search_emails results.
+        account: Optional. Account display name (or substring). Only needed
+            if entry_id is ambiguous across stores.
+
+    Returns:
+        Confirmation message with the email subject, or an error.
+    """
+    def _set(outlook, namespace, entry_id, account):
+        if account:
+            store = _require_store(namespace, account)
+            item = namespace.GetItemFromID(entry_id, store.StoreID)
+        else:
+            item = namespace.GetItemFromID(entry_id)
+        if err := _check_item_class(item, _OL_CLASS_MAIL, "mail item"):
+            return err
+        subject = item.Subject
+        item.FlagStatus = OL_FLAG_MARKED
+        item.Save()
+        return f"Flagged: '{subject}'"
+
+    try:
+        return await bridge.call(_set, entry_id, account)
+    except Exception as e:
+        return f"Error setting flag: {format_com_error(e)}"
+
+
+@mcp.tool()
+async def clear_flag(entry_id: str, account: str = "") -> str:
+    """Remove the follow-up flag from an email in Outlook.
+
+    Clears the flag set on the specified email (equivalent to right-clicking
+    the flag and selecting 'Clear Flag' in Outlook).
+
+    Args:
+        entry_id: The unique Outlook EntryID of the email. Get this from
+            list_emails or search_emails results.
+        account: Optional. Account display name (or substring). Only needed
+            if entry_id is ambiguous across stores.
+
+    Returns:
+        Confirmation message with the email subject, or an error.
+    """
+    def _clear(outlook, namespace, entry_id, account):
+        if account:
+            store = _require_store(namespace, account)
+            item = namespace.GetItemFromID(entry_id, store.StoreID)
+        else:
+            item = namespace.GetItemFromID(entry_id)
+        if err := _check_item_class(item, _OL_CLASS_MAIL, "mail item"):
+            return err
+        subject = item.Subject
+        # ClearTaskFlag() removes all follow-up flag properties in one call
+        # (FlagStatus, FlagRequest, TaskDueDate, TaskStartDate).
+        item.ClearTaskFlag()
+        item.Save()
+        return f"Flag cleared: '{subject}'"
+
+    try:
+        return await bridge.call(_clear, entry_id, account)
+    except Exception as e:
+        return f"Error clearing flag: {format_com_error(e)}"
+
+
+# =====================================================================
+# TOOL 7: move_email
 # =====================================================================
 
 @mcp.tool()

@@ -85,6 +85,13 @@ OL_IMPORTANCE_HIGH = 2
 
 IMPORTANCE_NAMES = {0: "low", 1: "normal", 2: "high"}
 
+# OlFlagStatus
+OL_FLAG_NONE = 0
+OL_FLAG_COMPLETE = 1
+OL_FLAG_MARKED = 2
+
+FLAG_STATUS_NAMES = {0: "none", 1: "complete", 2: "flagged"}
+
 # OlRuleActionType (common ones)
 OL_RULE_ACTION_MOVE = 1
 OL_RULE_ACTION_DELETE = 8
