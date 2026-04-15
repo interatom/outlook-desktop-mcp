@@ -203,6 +203,38 @@ async def run_tests():
             except Exception as e:
                 log(f"  FAIL: {e}")
 
+            # ----- Test 10: reply_email save_as_draft -----
+            total += 1
+            log("\n--- Test 10: reply_email (save_as_draft) ---")
+            draft_entry_id = None
+            try:
+                assert first_entry_id, "No entry_id from previous test"
+                result = await session.call_tool("reply_email", {
+                    "entry_id": first_entry_id,
+                    "body": "MCP draft reply test — please ignore",
+                    "save_as_draft": True,
+                })
+                content = result.content[0].text
+                draft = json.loads(content)
+                draft_entry_id = draft.get("entry_id")
+                log(f"  Draft entry_id: {(draft_entry_id or '')[:40]}...")
+                assert draft_entry_id, "Expected entry_id in response"
+                passed += 1
+                log("  PASS")
+            except Exception as e:
+                log(f"  FAIL: {e}")
+            finally:
+                # Clean up: move draft to Deleted Items so Drafts folder stays clean
+                if draft_entry_id:
+                    try:
+                        await session.call_tool("move_email", {
+                            "entry_id": draft_entry_id,
+                            "target_folder": "deleted",
+                        })
+                        log("  (draft cleaned up)")
+                    except Exception:
+                        pass  # best-effort cleanup
+
     log("")
     log("=" * 60)
     log(f"Results: {passed}/{total} passed")
