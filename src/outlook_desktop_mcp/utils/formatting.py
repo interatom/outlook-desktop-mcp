@@ -7,6 +7,7 @@ from outlook_desktop_mcp.tools._folder_constants import (
     RESPONSE_NAMES,
     TASK_STATUS_NAMES,
     IMPORTANCE_NAMES,
+    FLAG_STATUS_NAMES,
 )
 
 
@@ -31,6 +32,7 @@ def format_email_summary(item) -> dict:
         "sender_name": getattr(item, "SenderName", "unknown"),
         "received_time": str(item.ReceivedTime),
         "unread": bool(item.UnRead),
+        "flag_status": FLAG_STATUS_NAMES.get(getattr(item, "FlagStatus", 0), "none"),
         "has_attachments": bool(item.Attachments.Count > 0),
         "attachment_count": item.Attachments.Count,
     }
