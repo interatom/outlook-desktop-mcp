@@ -1716,6 +1716,45 @@ async def list_rules(account: str = "") -> str:
 
 
 @mcp.tool()
+async def get_rule(rule_name: str = "", account: str = "") -> str:
+    """Read a mail rule's full structure (conditions, exceptions, actions).
+
+    Fills the gap list_rules leaves: list_rules returns only name/enabled/index,
+    and create_rule/update_rule can set conditions but not read them back. This
+    serializes the rule(s) to JSON, resolving recipient conditions to primary
+    SMTP addresses server-side (Exchange X.500 DNs are resolved for you, so the
+    caller never sees an empty .Address or a raw DN).
+
+    Args:
+        rule_name: Exact rule name. Empty (default) returns ALL rules as an array.
+        account: Optional. Account display name (or substring) to target.
+
+    Returns:
+        JSON — a single rule object (rule_name given) or an array (all rules).
+        Each rule carries `fully_representable`: true when every condition/action
+        is within the set update_rule can edit in place (false => only the
+        Outlook Rules Wizard can safely edit it).
+    """
+    def _get(outlook, namespace, rule_name, account):
+        store = _require_store(namespace, account)
+        rules = store.GetRules()
+        if rule_name:
+            for i in range(1, rules.Count + 1):
+                if rules.Item(i).Name == rule_name:
+                    return json.dumps(_serialize_rule(rules.Item(i)),
+                                      indent=2, default=str)
+            return (f"Error: Rule '{rule_name}' not found. "
+                    "Use list_rules to see available rules.")
+        out = [_serialize_rule(rules.Item(i)) for i in range(1, rules.Count + 1)]
+        return json.dumps(out, indent=2, default=str)
+
+    try:
+        return await bridge.call(_get, rule_name, account)
+    except Exception as e:
+        return f"Error reading rule: {format_com_error(e)}"
+
+
+@mcp.tool()
 async def toggle_rule(
     rule_name: str,
     enabled: bool,
@@ -1817,6 +1856,179 @@ def _unsupported_rule_elements(rule):
             except Exception:
                 bad.append(f"<unreadable {kind}>")
     return bad
+
+
+# OlRuleConditionType / OlRuleActionType -> friendly name (from the Outlook
+# typelib; do NOT hand-guess these — a guessed map mislabeled Stop as
+# "StartApplication" and SenderAddress as "Sensitivity").
+_CONDITION_NAMES = {
+    0: "Unknown", 1: "From", 2: "Subject", 3: "Account", 4: "OnlyToMe",
+    5: "To", 6: "Importance", 7: "Sensitivity", 8: "FlaggedForAction",
+    9: "Cc", 10: "ToOrCc", 11: "NotTo", 12: "SentTo", 13: "Body",
+    14: "BodyOrSubject", 15: "MessageHeader", 16: "RecipientAddress",
+    17: "SenderAddress", 18: "Category", 19: "OOF", 20: "HasAttachment",
+    21: "SizeRange", 22: "DateRange", 23: "FormName", 24: "Property",
+    25: "SenderInAddressBook", 26: "MeetingInviteOrUpdate",
+    27: "LocalMachineOnly", 28: "OtherMachine", 29: "AnyCategory",
+    30: "FromRssFeed", 31: "FromAnyRssFeed",
+}
+_ACTION_NAMES = {
+    0: "Unknown", 1: "MoveToFolder", 2: "AssignToCategory", 3: "Delete",
+    4: "DeletePermanently", 5: "CopyToFolder", 6: "Forward",
+    7: "ForwardAsAttachment", 8: "Redirect", 9: "ServerReply", 10: "Template",
+    11: "FlagForActionInDays", 12: "FlagColor", 13: "FlagClear",
+    14: "Importance", 15: "Sensitivity", 16: "Print", 17: "PlaySound",
+    18: "StartApplication", 19: "MarkRead", 20: "RunScript", 21: "Stop",
+    22: "CustomAction", 23: "NewItemAlert", 24: "DesktopAlert",
+    25: "NotifyRead", 26: "NotifyDelivery", 27: "CcMessage", 28: "Defer",
+    29: "MarkAsTask", 30: "ClearCategories",
+}
+
+_PR_SMTP_ADDRESS = "http://schemas.microsoft.com/mapi/proptag/0x39FE001E"
+
+
+def _recipient_smtp(recipient):
+    """Resolve a rule recipient to its primary SMTP address.
+
+    Rule-condition recipients report an empty .Address; the real value lives on
+    the AddressEntry, where Exchange entries carry an X.500 DN ("/o=...") rather
+    than SMTP. Resolve those via GetExchangeUser / GetExchangeDistributionList,
+    fall back to the PR_SMTP_ADDRESS MAPI property, then to the raw DN. Callers
+    never see an empty address or a bare DN.
+    """
+    try:
+        ae = recipient.AddressEntry
+    except Exception:
+        return ""
+    try:
+        addr = ae.Address or ""
+    except Exception:
+        addr = ""
+    if addr and not addr.startswith("/"):
+        return addr  # already an SMTP address
+    for getter in ("GetExchangeUser", "GetExchangeDistributionList"):
+        try:
+            obj = getattr(ae, getter)()
+            if obj and obj.PrimarySmtpAddress:
+                return obj.PrimarySmtpAddress
+        except Exception:
+            pass
+    try:
+        val = ae.PropertyAccessor.GetProperty(_PR_SMTP_ADDRESS)
+        if val:
+            return val
+    except Exception:
+        pass
+    return addr
+
+
+def _serialize_conditions(coll):
+    """Serialize the enabled conditions of a RuleConditions collection.
+
+    The enumerated Item(i) exposes only ConditionType/Enabled — the typed
+    payload (text, recipients, ...) is reachable only via the matching NAMED
+    property (coll.From, coll.Body, ...). So read the type from the item but the
+    payload from getattr(coll, <name>).
+    """
+    out = []
+    try:
+        n = coll.Count
+    except Exception:
+        return out
+    for i in range(1, n + 1):
+        try:
+            it = coll.Item(i)
+            if not it.Enabled:
+                continue
+            t = int(it.ConditionType)
+        except Exception:
+            continue
+        name = _CONDITION_NAMES.get(t)
+        d = {"type": name or f"type{t}"}
+        cond = it
+        if name:
+            try:
+                cond = getattr(coll, name)
+            except Exception:
+                cond = it
+        for attr, key in (("Text", "text"), ("Address", "address"),
+                          ("Categories", "categories"), ("FormName", "form")):
+            try:
+                v = getattr(cond, attr)
+                if v:
+                    d[key] = list(v) if not isinstance(v, str) else v
+            except Exception:
+                pass
+        try:
+            reps = cond.Recipients
+            rcs = [{"display": reps.Item(k).Name,
+                    "smtp": _recipient_smtp(reps.Item(k))}
+                   for k in range(1, reps.Count + 1)]
+            if rcs:
+                d["recipients"] = rcs
+        except Exception:
+            pass
+        out.append(d)
+    return out
+
+
+def _serialize_actions(coll):
+    """Serialize the enabled actions of a RuleActions collection.
+
+    Same indirection as _serialize_conditions: the action's payload (target
+    folder, categories) lives on the named property, not the enumerated item.
+    """
+    out = []
+    try:
+        n = coll.Count
+    except Exception:
+        return out
+    for i in range(1, n + 1):
+        try:
+            it = coll.Item(i)
+            if not it.Enabled:
+                continue
+            t = int(it.ActionType)
+        except Exception:
+            continue
+        name = _ACTION_NAMES.get(t)
+        d = {"type": name or f"type{t}"}
+        act = it
+        if name:
+            try:
+                act = getattr(coll, name)
+            except Exception:
+                act = it
+        try:
+            if act.Folder:
+                d["folder"] = act.Folder.FolderPath
+        except Exception:
+            pass
+        try:
+            if act.Categories:
+                d["categories"] = list(act.Categories)
+        except Exception:
+            pass
+        out.append(d)
+    return out
+
+
+def _serialize_rule(rule):
+    """Full structured view of a rule, with recipients resolved to SMTP and a
+    `fully_representable` flag (= editable in place by update_rule)."""
+    try:
+        order = rule.ExecutionOrder
+    except Exception:
+        order = None
+    return {
+        "name": rule.Name,
+        "enabled": bool(rule.Enabled),
+        "execution_order": order,
+        "conditions": _serialize_conditions(rule.Conditions),
+        "exceptions": _serialize_conditions(rule.Exceptions),
+        "actions": _serialize_actions(rule.Actions),
+        "fully_representable": not _unsupported_rule_elements(rule),
+    }
 
 
 @mcp.tool()
