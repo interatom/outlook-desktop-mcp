@@ -2102,6 +2102,23 @@ def _serialize_conditions(coll):
     return out
 
 
+def _relative_folder_path(folder):
+    """Convert a MAPIFolder's FolderPath ("\\\\Store\\Inbox\\Sub") to a relative
+    slash-path ("Inbox/Sub") — the same form create_rule / update_rule accept for
+    move_to_folder, so get_rule output round-trips straight back as input.
+    """
+    try:
+        path = folder.FolderPath
+    except Exception:
+        return None
+    if not path:
+        return None
+    parts = path.lstrip("\\").split("\\")
+    if len(parts) > 1:
+        parts = parts[1:]  # drop the leading store/root segment
+    return "/".join(parts)
+
+
 def _serialize_actions(coll):
     """Serialize the enabled actions of a RuleActions collection.
 
@@ -2131,7 +2148,7 @@ def _serialize_actions(coll):
                 act = it
         try:
             if act.Folder:
-                d["folder"] = act.Folder.FolderPath
+                d["folder"] = _relative_folder_path(act.Folder)
         except Exception:
             pass
         try:
