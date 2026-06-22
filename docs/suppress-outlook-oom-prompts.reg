@@ -1,0 +1,22 @@
+Windows Registry Editor Version 5.00
+
+; Suppress Outlook "Programmatic Access" security prompts (Object Model Guard).
+;
+; Apply this .reg file as a local Administrator (right-click > Merge), then
+; restart Outlook. Authoritative for Outlook 2016+ / Microsoft 365 Apps.
+;
+; On corporate-managed (Intune/MDM) machines the HKCU\Software\Policies branch
+; is often read-only for the user. The HKLM keys below require an elevated
+; command prompt or admin-level Registry Editor to apply.
+;
+; Value 2 = "automatically approve" for that prompt category.
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Office\16.0\Outlook\Security]
+"AdminSecurityMode"=dword:00000003
+"PromptOOMSend"=dword:00000002
+"PromptOOMAddressBookAccess"=dword:00000002
+"PromptOOMAddressInformationAccess"=dword:00000002
+"PromptOOMMeetingTaskRequestResponse"=dword:00000002
+"PromptOOMResponse"=dword:00000002
+"PromptOOMSaveAs"=dword:00000002
+"PromptOOMFormulaAccess"=dword:00000002

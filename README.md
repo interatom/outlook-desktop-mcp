@@ -63,8 +63,28 @@ The server is structured as two parallel implementations with identical tool nam
 ### Windows
 
 - **Outlook Desktop (Classic)** — the `OUTLOOK.EXE` that comes with Microsoft 365 / Office. The new "modern" Outlook (`olk.exe`) does **not** support COM
-- **Python 3.12+**
+- **Python 3.12+** (x64 or ARM64)
 - **Outlook must be running** when the MCP server starts
+
+Both x64 and ARM64 Windows are supported. On ARM64, all dependencies (`pywin32`, `mcp`, `pydantic-core`, `cryptography`, `cffi`, `rpds-py`) have prebuilt `win_arm64` wheels — see the [ARM64 install notes](#arm64-windows) below for the one extra `pip` flag you need.
+
+#### Outlook "Programmatic Access" security prompts
+
+When the MCP server first touches Outlook's COM API, Outlook may show a dialog: *"A program is trying to access email address information stored in Outlook"* (the Object Model Guard / Programmatic Access prompt). This is Outlook's protection against malicious automation.
+
+You have three options:
+
+1. **Click "Allow access for 10 minutes"** every time you start a session. Fine for casual use.
+2. **Get the antivirus status to "Valid"** in *File > Options > Trust Center > Trust Center Settings > Programmatic Access*. When that line reads `Valid`, the "Never warn me about suspicious activity" radio becomes selectable and the prompts go away. On most personal machines with current Defender this works out of the box.
+3. **Apply the registry policy** in [`docs/suppress-outlook-oom-prompts.reg`](docs/suppress-outlook-oom-prompts.reg). From an **elevated** PowerShell or Command Prompt (Win+X → *Terminal (Admin)*), run:
+
+   ```powershell
+   reg import "C:\path\to\outlook-desktop-mcp\docs\suppress-outlook-oom-prompts.reg"
+   ```
+
+   Then fully quit Outlook (check Task Manager for stray `OUTLOOK.EXE` processes) and reopen it. This writes `AdminSecurityMode=3` and approves all `PromptOOM*` categories under `HKLM\Software\Policies\Microsoft\Office\16.0\Outlook\Security`, which Outlook honors regardless of AV status. On Intune/MDM-managed corporate devices, `HKCU\Software\Policies\...\Outlook` is locked and the HKLM keys may be overwritten on next policy sync — if `reg import` fails or the prompts come back, ask IT to push the equivalent settings via Group Policy.
+
+> **Windows 11 ARM64 note:** Defender does not register with Outlook's `IOfficeAntiVirus` interface on ARM64, so Trust Center shows *"Antivirus status: Invalid"* and the *"Never warn me about suspicious activity"* radio stays greyed out **even when Outlook is launched as Administrator**. Option 2 is unavailable on ARM64; the `reg import` from option 3 is the only durable suppression path.
 
 ### macOS
 
@@ -187,7 +207,7 @@ Each tool constructs a single AppleScript that fetches all needed data in one `o
 
 ## Install from Source
 
-### Windows
+### Windows (x64)
 
 ```bash
 git clone https://github.com/Aanerud/outlook-desktop-mcp.git
@@ -199,6 +219,29 @@ python .venv\Scripts\pywin32_postinstall.py -install
 ```
 
 Register from source using the launcher script:
+
+```bash
+claude mcp add outlook-desktop -- powershell.exe -Command "& 'C:\path\to\outlook-desktop-mcp\outlook-desktop-mcp.cmd' mcp"
+```
+
+### Windows (ARM64)
+
+The `[cli]` extra of `mcp` transitively pulls in `cryptography`, and pip's default resolver may pick a version that lacks a `win_arm64` wheel — which then fails to build because it requires a Rust toolchain plus OpenSSL. Install without the `cli` extra and force wheels-only resolution:
+
+```powershell
+git clone https://github.com/Aanerud/outlook-desktop-mcp.git
+cd outlook-desktop-mcp
+& "C:\Program Files\Python312-arm64\python.exe" -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install --only-binary=:all: pywin32 mcp
+python -m pip install --no-deps -e .
+python .venv\Scripts\pywin32_postinstall.py -install
+```
+
+The base `mcp` package is sufficient for running the stdio server — the `[cli]` extra is only needed for the `mcp` developer CLI tools (`mcp dev`, `mcp inspector`), which aren't used at runtime.
+
+Register from source the same way as x64:
 
 ```bash
 claude mcp add outlook-desktop -- powershell.exe -Command "& 'C:\path\to\outlook-desktop-mcp\outlook-desktop-mcp.cmd' mcp"
