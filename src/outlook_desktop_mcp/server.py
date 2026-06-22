@@ -2564,6 +2564,65 @@ async def update_rule(
         return f"Error updating rule: {format_com_error(e)}"
 
 
+@mcp.tool()
+async def run_rule_now(
+    rule_name: str,
+    folder: str = "inbox",
+    include_subfolders: bool = False,
+    account: str = "",
+) -> str:
+    """Run an existing rule against mail ALREADY in a folder (backlog sweep).
+
+    CAUTION: this MUTATES mail immediately — it applies the rule's actions
+    (move/delete/categorize) to matching messages already sitting in the folder.
+    Confirm the rule and folder before calling. Normal rules only fire on
+    incoming mail; this is how you retroactively apply one to a backlog.
+
+    Args:
+        rule_name: Exact name of the rule to run. Use get_rule to inspect it first.
+        folder: Folder to run against (built-in name, root name, or slash-path).
+            Default "inbox".
+        include_subfolders: Also process the folder's subfolders. Default False.
+        account: Optional. Account display name (or substring) to target.
+
+    Returns:
+        Confirmation, or an error if the rule or folder was not found.
+    """
+    def _run(outlook, namespace, rule_name, folder, include_subfolders, account):
+        store = _require_store(namespace, account)
+
+        target = _resolve_folder(namespace, folder, store) if folder else None
+        if target is None:
+            return (f"Error: folder '{folder}' not found. "
+                    "Use list_folders to see available folders.")
+
+        rules = store.GetRules()
+        rule = None
+        for i in range(1, rules.Count + 1):
+            if rules.Item(i).Name == rule_name:
+                rule = rules.Item(i)
+                break
+        if rule is None:
+            return (f"Error: Rule '{rule_name}' not found. "
+                    "Use list_rules to see available rules.")
+
+        logger.warning("run_rule_now: executing '%s' on '%s' (subfolders=%s)",
+                       rule_name, target.Name, include_subfolders)
+        # Execute(ShowProgress, Folder, IncludeSubfolders, RuleExecuteOption);
+        # RuleExecuteOption 0 = all messages (OlRuleExecuteOption not in typelib).
+        rule.Execute(False, target, bool(include_subfolders), 0)
+
+        sub = " (incl. subfolders)" if include_subfolders else ""
+        return f"Rule '{rule_name}' executed against '{target.Name}'{sub}."
+
+    try:
+        return await bridge.call(
+            _run, rule_name, folder, include_subfolders, account,
+        )
+    except Exception as e:
+        return f"Error running rule: {format_com_error(e)}"
+
+
 # =====================================================================
 # OUT OF OFFICE TOOLS
 # =====================================================================
