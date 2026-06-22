@@ -1757,6 +1757,178 @@ async def toggle_rule(
         return f"Error toggling rule: {format_com_error(e)}"
 
 
+@mcp.tool()
+async def create_rule(
+    name: str,
+    move_to_folder: str = "",
+    from_addresses: str = "",
+    subject_contains: str = "",
+    assign_category: str = "",
+    delete: bool = False,
+    stop_processing: bool = False,
+    enabled: bool = True,
+    account: str = "",
+) -> str:
+    """Create a new receive rule in Outlook.
+
+    CAUTION: This creates a live mail rule immediately. Rules run on incoming
+    mail — confirm the conditions and the target folder before calling.
+
+    At least one condition (from_addresses or subject_contains) AND at least one
+    action (move_to_folder, assign_category, delete, or stop_processing) must be
+    supplied.
+
+    Args:
+        name: Display name for the new rule. Must be unique.
+        move_to_folder: Optional. Folder to move matching mail to. Accepts a
+            built-in name ("inbox"), a root folder name, or a slash-path
+            ("Inbox/Receipts") — resolved the same way as list_emails.
+        from_addresses: Optional. Semicolon-separated sender-address fragments;
+            matches when the sender SMTP address contains any of them
+            (e.g. "github.com;noreply@gitlab.com").
+        subject_contains: Optional. Semicolon-separated words/phrases; matches
+            when the subject contains any of them.
+        assign_category: Optional. Color-category name to assign to matching mail.
+        delete: Optional. Move matching mail to Deleted Items. Default False.
+        stop_processing: Optional. Stop evaluating further rules after this one.
+            Default False.
+        enabled: Optional. Whether the rule is active. Default True.
+        account: Optional. Account display name (or substring) to target.
+
+    Returns:
+        Confirmation with the rule name and a summary of its conditions/actions.
+
+    Note:
+        Outlook's COM object model exposes only a subset of the Rules Wizard's
+        conditions/actions. The MoveToFolder action's Folder is a by-reference
+        property: a plain assignment silently no-ops and the Save() then fails
+        with "invalid actions or conditions"; this tool forces the required
+        PROPERTYPUTREF internally.
+    """
+    def _create(outlook, namespace, name, move_to_folder, from_addresses,
+                subject_contains, assign_category, delete, stop_processing,
+                enabled, account):
+        import pythoncom
+
+        store = _require_store(namespace, account)
+
+        senders = [s.strip() for s in from_addresses.split(";") if s.strip()]
+        subjects = [s.strip() for s in subject_contains.split(";") if s.strip()]
+
+        if not (senders or subjects):
+            return ("Error: at least one condition required "
+                    "(from_addresses or subject_contains).")
+        if not (move_to_folder or assign_category or delete or stop_processing):
+            return ("Error: at least one action required "
+                    "(move_to_folder, assign_category, delete, or stop_processing).")
+
+        # Resolve the target folder up front, so we fail before creating a
+        # half-built rule rather than after.
+        target = None
+        if move_to_folder:
+            target = _resolve_folder(namespace, move_to_folder, store)
+            if target is None:
+                return (f"Error: folder '{move_to_folder}' not found. "
+                        "Use list_folders to see available folders.")
+
+        rules = store.GetRules()
+        for i in range(rules.Count):
+            if rules.Item(i + 1).Name == name:
+                return f"Error: a rule named '{name}' already exists."
+
+        rule = rules.Create(name, 0)  # 0 = olRuleReceive
+
+        # --- Conditions ---
+        conds = []
+        if senders:
+            cond = rule.Conditions.SenderAddress
+            cond.Address = senders
+            cond.Enabled = True
+            conds.append(f"sender address contains {senders}")
+        if subjects:
+            cond = rule.Conditions.Subject
+            cond.Text = subjects
+            cond.Enabled = True
+            conds.append(f"subject contains {subjects}")
+
+        # --- Actions ---
+        applied = []
+        if target is not None:
+            act = rule.Actions.MoveToFolder
+            act.Enabled = True
+            # Folder is a by-reference property — PROPERTYPUT (PowerShell '=',
+            # win32com's default attribute assignment) silently does nothing,
+            # leaving an invalid action and a failing Save(). Force PUTREF.
+            dispid = act._oleobj_.GetIDsOfNames("Folder")
+            act._oleobj_.Invoke(
+                dispid, 0, pythoncom.DISPATCH_PROPERTYPUTREF, False, target
+            )
+            applied.append(f"move to '{target.Name}'")
+        if assign_category:
+            act = rule.Actions.AssignToCategory
+            act.Categories = [assign_category]
+            act.Enabled = True
+            applied.append(f"assign category '{assign_category}'")
+        if delete:
+            rule.Actions.Delete.Enabled = True
+            applied.append("delete (move to Deleted Items)")
+        if stop_processing:
+            rule.Actions.Stop.Enabled = True
+            applied.append("stop processing further rules")
+
+        rule.Enabled = bool(enabled)
+
+        logger.warning("create_rule: creating rule '%s'", name)
+        rules.Save()
+
+        status = "enabled" if enabled else "disabled"
+        return (
+            f"Rule '{name}' created ({status}).\n"
+            f"Conditions: {'; '.join(conds)}\n"
+            f"Actions: {'; '.join(applied)}"
+        )
+
+    try:
+        return await bridge.call(
+            _create, name, move_to_folder, from_addresses, subject_contains,
+            assign_category, delete, stop_processing, enabled, account,
+        )
+    except Exception as e:
+        return f"Error creating rule: {format_com_error(e)}"
+
+
+@mcp.tool()
+async def delete_rule(rule_name: str, account: str = "") -> str:
+    """Delete a mail rule by name.
+
+    CAUTION: This permanently removes a live mail rule. Confirm the exact name
+    with list_rules before calling.
+
+    Args:
+        rule_name: Exact name of the rule to delete.
+        account: Optional. Account display name (or substring) to target.
+
+    Returns:
+        Confirmation, or an error if the rule was not found.
+    """
+    def _delete(outlook, namespace, rule_name, account):
+        store = _require_store(namespace, account)
+        rules = store.GetRules()
+        for i in range(rules.Count, 0, -1):
+            if rules.Item(i).Name == rule_name:
+                logger.warning("delete_rule: removing rule '%s'", rule_name)
+                rules.Remove(i)
+                rules.Save()
+                return f"Rule '{rule_name}' deleted."
+        return (f"Error: Rule '{rule_name}' not found. "
+                "Use list_rules to see available rules.")
+
+    try:
+        return await bridge.call(_delete, rule_name, account)
+    except Exception as e:
+        return f"Error deleting rule: {format_com_error(e)}"
+
+
 # =====================================================================
 # OUT OF OFFICE TOOLS
 # =====================================================================
