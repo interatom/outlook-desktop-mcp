@@ -16,6 +16,7 @@ from mcp.server.fastmcp import FastMCP
 
 from outlook_desktop_mcp.com_bridge import OutlookBridge
 from datetime import datetime, timedelta
+import locale as _locale
 
 import os
 
@@ -906,6 +907,21 @@ def _parse_date(date_str: str) -> datetime:
     return datetime.fromisoformat(date_str)
 
 
+def _date_to_restrict_str(dt: datetime) -> str:
+    """Format datetime for Outlook Restrict() using the system locale's date order.
+
+    Outlook's COM Restrict() parses date strings using the Windows system locale.
+    Using %x (locale's preferred short date) ensures day/month order matches,
+    avoiding the MM/DD vs DD/MM swap on non-US locales (e.g. de-DE).
+    """
+    saved = _locale.getlocale(_locale.LC_TIME)
+    try:
+        _locale.setlocale(_locale.LC_TIME, "")
+        return dt.strftime("%x %H:%M")
+    finally:
+        _locale.setlocale(_locale.LC_TIME, saved)
+
+
 # =====================================================================
 # TOOL 10: list_events
 # =====================================================================
@@ -952,8 +968,8 @@ async def list_events(
         end = _parse_date(end_date) if end_date else start + timedelta(days=7)
 
         restrict = (
-            f"[Start] >= '{start.strftime('%m/%d/%Y %H:%M')}' "
-            f"AND [Start] <= '{end.strftime('%m/%d/%Y %H:%M')}'"
+            f"[Start] >= '{_date_to_restrict_str(start)}' "
+            f"AND [Start] <= '{_date_to_restrict_str(end)}'"
         )
         filtered = items.Restrict(restrict)
 
@@ -1389,8 +1405,8 @@ async def search_events(
         end = _parse_date(end_date) if end_date else datetime.now() + timedelta(days=30)
 
         restrict = (
-            f"[Start] >= '{start.strftime('%m/%d/%Y %H:%M')}' "
-            f"AND [Start] <= '{end.strftime('%m/%d/%Y %H:%M')}'"
+            f"[Start] >= '{_date_to_restrict_str(start)}' "
+            f"AND [Start] <= '{_date_to_restrict_str(end)}'"
         )
         filtered = items.Restrict(restrict)
 
