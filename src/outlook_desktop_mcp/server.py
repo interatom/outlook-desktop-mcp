@@ -1929,6 +1929,51 @@ async def delete_rule(rule_name: str, account: str = "") -> str:
         return f"Error deleting rule: {format_com_error(e)}"
 
 
+@mcp.tool()
+async def rename_rule(rule_name: str, new_name: str, account: str = "") -> str:
+    """Rename an existing mail rule.
+
+    Changes only the rule's display name — its conditions and actions are left
+    untouched. This is safe even for rules created in the Rules Wizard with
+    conditions the COM object model can't fully represent: there is no edit of
+    a rule's logic here, so nothing can be silently dropped on Save().
+
+    (To change a rule's conditions or actions, delete it and recreate it with
+    create_rule — re-saving an edited Wizard rule can drop conditions the object
+    model doesn't model.)
+
+    Args:
+        rule_name: Exact current name of the rule. Use list_rules to confirm.
+        new_name: New display name. Must not collide with an existing rule.
+        account: Optional. Account display name (or substring) to target.
+
+    Returns:
+        Confirmation, or an error if the rule was not found or the name is taken.
+    """
+    def _rename(outlook, namespace, rule_name, new_name, account):
+        store = _require_store(namespace, account)
+        rules = store.GetRules()
+        target = None
+        for i in range(rules.Count):
+            name = rules.Item(i + 1).Name
+            if name == new_name:
+                return f"Error: a rule named '{new_name}' already exists."
+            if name == rule_name:
+                target = rules.Item(i + 1)
+        if target is None:
+            return (f"Error: Rule '{rule_name}' not found. "
+                    "Use list_rules to see available rules.")
+        logger.warning("rename_rule: '%s' -> '%s'", rule_name, new_name)
+        target.Name = new_name
+        rules.Save()
+        return f"Rule '{rule_name}' renamed to '{new_name}'."
+
+    try:
+        return await bridge.call(_rename, rule_name, new_name, account)
+    except Exception as e:
+        return f"Error renaming rule: {format_com_error(e)}"
+
+
 # =====================================================================
 # OUT OF OFFICE TOOLS
 # =====================================================================
