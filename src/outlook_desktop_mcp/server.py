@@ -1757,12 +1757,78 @@ async def toggle_rule(
         return f"Error toggling rule: {format_com_error(e)}"
 
 
+# --- Rule helpers (shared by create_rule / update_rule) ---
+
+# OlRuleConditionType / OlRuleActionType ints these tools can read AND write
+# back losslessly (verified by round-trip spike). update_rule refuses to
+# re-save a rule containing anything outside these sets, because Save()
+# re-serializes the whole rule and an unrepresentable element could be dropped.
+_SAFE_CONDITION_TYPES = {1, 2, 11, 12, 13, 15, 17, 23}
+#   From=1 Subject=2 NotTo=11 SentTo=12 Body=13 MessageHeader=15
+#   SenderAddress=17 FormName=23
+_SAFE_ACTION_TYPES = {1, 2, 3, 21}
+#   MoveToFolder=1 AssignToCategory=2 Delete=3 Stop=21
+
+
+def _split_list(raw):
+    """Split a ';'-separated tool argument into a clean list of fragments."""
+    return [s.strip() for s in raw.split(";") if s.strip()]
+
+
+def _force_folder_putref(action, folder):
+    """Set a RuleAction's by-reference Folder property.
+
+    A plain attribute assignment (PROPERTYPUT) silently no-ops for this
+    by-reference property, leaving an invalid action that fails Rules.Save().
+    Force PROPERTYPUTREF via a low-level Invoke.
+    """
+    import pythoncom
+    dispid = action._oleobj_.GetIDsOfNames("Folder")
+    action._oleobj_.Invoke(
+        dispid, 0, pythoncom.DISPATCH_PROPERTYPUTREF, False, folder
+    )
+
+
+def _unsupported_rule_elements(rule):
+    """List labels for enabled conditions/actions outside the round-trip-safe
+    set. Empty => the rule is safe to edit in place; non-empty => a Save() might
+    drop those elements, so update_rule refuses to touch it.
+    """
+    bad = []
+    checks = (
+        (rule.Conditions, _SAFE_CONDITION_TYPES, "condition", False),
+        (rule.Exceptions, _SAFE_CONDITION_TYPES, "exception", False),
+        (rule.Actions, _SAFE_ACTION_TYPES, "action", True),
+    )
+    for coll, safe, kind, is_action in checks:
+        try:
+            n = coll.Count
+        except Exception:
+            bad.append(f"<non-enumerable {kind} set>")
+            continue
+        for i in range(1, n + 1):
+            try:
+                it = coll.Item(i)
+                if not it.Enabled:
+                    continue
+                t = int(it.ActionType) if is_action else int(it.ConditionType)
+                if t not in safe:
+                    bad.append(f"{kind} type {t}")
+            except Exception:
+                bad.append(f"<unreadable {kind}>")
+    return bad
+
+
 @mcp.tool()
 async def create_rule(
     name: str,
     move_to_folder: str = "",
     from_addresses: str = "",
     subject_contains: str = "",
+    body_contains: str = "",
+    header_contains: str = "",
+    sent_to: str = "",
+    not_to: bool = False,
     assign_category: str = "",
     delete: bool = False,
     stop_processing: bool = False,
@@ -1774,9 +1840,9 @@ async def create_rule(
     CAUTION: This creates a live mail rule immediately. Rules run on incoming
     mail — confirm the conditions and the target folder before calling.
 
-    At least one condition (from_addresses or subject_contains) AND at least one
-    action (move_to_folder, assign_category, delete, or stop_processing) must be
-    supplied.
+    At least one condition (from_addresses, subject_contains, body_contains,
+    header_contains, sent_to, or not_to) AND at least one action
+    (move_to_folder, assign_category, delete, or stop_processing) must be supplied.
 
     Args:
         name: Display name for the new rule. Must be unique.
@@ -1788,6 +1854,14 @@ async def create_rule(
             (e.g. "github.com;noreply@gitlab.com").
         subject_contains: Optional. Semicolon-separated words/phrases; matches
             when the subject contains any of them.
+        body_contains: Optional. Semicolon-separated words/phrases matched
+            against the message body.
+        header_contains: Optional. Semicolon-separated words/phrases matched
+            against the raw message header (e.g. "X-GitHub-Reason").
+        sent_to: Optional. Semicolon-separated recipient addresses; matches when
+            the message was sent to any of them.
+        not_to: Optional. Match mail where you are NOT a direct (To) recipient
+            (e.g. you were only CC'd). Default False.
         assign_category: Optional. Color-category name to assign to matching mail.
         delete: Optional. Move matching mail to Deleted Items. Default False.
         stop_processing: Optional. Stop evaluating further rules after this one.
@@ -1806,18 +1880,21 @@ async def create_rule(
         PROPERTYPUTREF internally.
     """
     def _create(outlook, namespace, name, move_to_folder, from_addresses,
-                subject_contains, assign_category, delete, stop_processing,
-                enabled, account):
-        import pythoncom
-
+                subject_contains, body_contains, header_contains, sent_to,
+                not_to, assign_category, delete, stop_processing, enabled,
+                account):
         store = _require_store(namespace, account)
 
-        senders = [s.strip() for s in from_addresses.split(";") if s.strip()]
-        subjects = [s.strip() for s in subject_contains.split(";") if s.strip()]
+        senders = _split_list(from_addresses)
+        subjects = _split_list(subject_contains)
+        bodies = _split_list(body_contains)
+        headers = _split_list(header_contains)
+        tos = _split_list(sent_to)
 
-        if not (senders or subjects):
-            return ("Error: at least one condition required "
-                    "(from_addresses or subject_contains).")
+        if not (senders or subjects or bodies or headers or tos or not_to):
+            return ("Error: at least one condition required (from_addresses, "
+                    "subject_contains, body_contains, header_contains, sent_to, "
+                    "or not_to).")
         if not (move_to_folder or assign_category or delete or stop_processing):
             return ("Error: at least one action required "
                     "(move_to_folder, assign_category, delete, or stop_processing).")
@@ -1850,19 +1927,33 @@ async def create_rule(
             cond.Text = subjects
             cond.Enabled = True
             conds.append(f"subject contains {subjects}")
+        if bodies:
+            cond = rule.Conditions.Body
+            cond.Text = bodies
+            cond.Enabled = True
+            conds.append(f"body contains {bodies}")
+        if headers:
+            cond = rule.Conditions.MessageHeader
+            cond.Text = headers
+            cond.Enabled = True
+            conds.append(f"header contains {headers}")
+        if tos:
+            cond = rule.Conditions.SentTo
+            for addr in tos:
+                cond.Recipients.Add(addr)
+            cond.Recipients.ResolveAll()
+            cond.Enabled = True
+            conds.append(f"sent to {tos}")
+        if not_to:
+            rule.Conditions.NotTo.Enabled = True
+            conds.append("not sent directly to me")
 
         # --- Actions ---
         applied = []
         if target is not None:
             act = rule.Actions.MoveToFolder
             act.Enabled = True
-            # Folder is a by-reference property — PROPERTYPUT (PowerShell '=',
-            # win32com's default attribute assignment) silently does nothing,
-            # leaving an invalid action and a failing Save(). Force PUTREF.
-            dispid = act._oleobj_.GetIDsOfNames("Folder")
-            act._oleobj_.Invoke(
-                dispid, 0, pythoncom.DISPATCH_PROPERTYPUTREF, False, target
-            )
+            _force_folder_putref(act, target)
             applied.append(f"move to '{target.Name}'")
         if assign_category:
             act = rule.Actions.AssignToCategory
@@ -1891,7 +1982,8 @@ async def create_rule(
     try:
         return await bridge.call(
             _create, name, move_to_folder, from_addresses, subject_contains,
-            assign_category, delete, stop_processing, enabled, account,
+            body_contains, header_contains, sent_to, not_to, assign_category,
+            delete, stop_processing, enabled, account,
         )
     except Exception as e:
         return f"Error creating rule: {format_com_error(e)}"
@@ -1938,9 +2030,8 @@ async def rename_rule(rule_name: str, new_name: str, account: str = "") -> str:
     conditions the COM object model can't fully represent: there is no edit of
     a rule's logic here, so nothing can be silently dropped on Save().
 
-    (To change a rule's conditions or actions, delete it and recreate it with
-    create_rule — re-saving an edited Wizard rule can drop conditions the object
-    model doesn't model.)
+    (To change a rule's conditions or actions, use update_rule, which edits in
+    place and preserves everything it doesn't touch.)
 
     Args:
         rule_name: Exact current name of the rule. Use list_rules to confirm.
@@ -1972,6 +2063,163 @@ async def rename_rule(rule_name: str, new_name: str, account: str = "") -> str:
         return await bridge.call(_rename, rule_name, new_name, account)
     except Exception as e:
         return f"Error renaming rule: {format_com_error(e)}"
+
+
+@mcp.tool()
+async def update_rule(
+    rule_name: str,
+    move_to_folder: str = "",
+    from_addresses: str = "",
+    subject_contains: str = "",
+    body_contains: str = "",
+    header_contains: str = "",
+    sent_to: str = "",
+    assign_category: str = "",
+    not_to: bool | None = None,
+    delete: bool | None = None,
+    stop_processing: bool | None = None,
+    account: str = "",
+) -> str:
+    """Modify an existing rule in place, changing only the facets you specify.
+
+    CAUTION: This modifies a live mail rule immediately.
+
+    Unlike delete + recreate, this PRESERVES every condition and action you do
+    NOT name — including ones create_rule can't build — because Save() keeps the
+    rest of the rule intact (verified by round-trip).
+
+    SAFETY: before saving, the rule is scanned; if it contains any enabled
+    condition or action of a type these tools can't read back losslessly, the
+    update is REFUSED with the rule untouched (edit such a rule in Outlook).
+
+    Facet semantics:
+      - List args (from_addresses, subject_contains, body_contains,
+        header_contains, sent_to): a non-empty value REPLACES that condition;
+        empty (default) leaves it unchanged.
+      - move_to_folder / assign_category: a non-empty value sets/changes that
+        action.
+      - not_to / delete / stop_processing: True enables, False disables, omitted
+        (None) leaves unchanged.
+
+    Args:
+        rule_name: Exact name of the rule to modify.
+        move_to_folder: New target folder (built-in name, root name, or slash-path).
+        from_addresses: Semicolon-separated sender-address fragments (replaces).
+        subject_contains: Semicolon-separated subject phrases (replaces).
+        body_contains: Semicolon-separated body phrases (replaces).
+        header_contains: Semicolon-separated message-header phrases (replaces).
+        sent_to: Semicolon-separated recipient addresses (replaces).
+        assign_category: Color-category name to assign.
+        not_to: Enable/disable the "not sent directly to me" condition.
+        delete: Enable/disable the delete (move to Deleted Items) action.
+        stop_processing: Enable/disable the "stop processing more rules" action.
+        account: Optional. Account display name (or substring) to target.
+
+    Returns:
+        Confirmation summarizing what changed, or an error.
+    """
+    def _update(outlook, namespace, rule_name, move_to_folder, from_addresses,
+                subject_contains, body_contains, header_contains, sent_to,
+                assign_category, not_to, delete, stop_processing, account):
+        store = _require_store(namespace, account)
+
+        # Resolve folder up front (fail before mutating anything).
+        target = None
+        if move_to_folder:
+            target = _resolve_folder(namespace, move_to_folder, store)
+            if target is None:
+                return (f"Error: folder '{move_to_folder}' not found. "
+                        "Use list_folders to see available folders.")
+
+        rules = store.GetRules()
+        rule = None
+        for i in range(1, rules.Count + 1):
+            if rules.Item(i).Name == rule_name:
+                rule = rules.Item(i)
+                break
+        if rule is None:
+            return (f"Error: Rule '{rule_name}' not found. "
+                    "Use list_rules to see available rules.")
+
+        # Refuse to re-save a rule with elements we can't round-trip safely.
+        bad = _unsupported_rule_elements(rule)
+        if bad:
+            return ("Error: rule '%s' contains element(s) this tool can't safely "
+                    "re-save (%s). Edit it manually in Outlook to avoid data loss."
+                    % (rule_name, ", ".join(sorted(set(bad)))))
+
+        changed = []
+        froms = _split_list(from_addresses)
+        if froms:
+            c = rule.Conditions.SenderAddress
+            c.Address = froms
+            c.Enabled = True
+            changed.append(f"sender address -> {froms}")
+        subjects = _split_list(subject_contains)
+        if subjects:
+            c = rule.Conditions.Subject
+            c.Text = subjects
+            c.Enabled = True
+            changed.append(f"subject -> {subjects}")
+        bodies = _split_list(body_contains)
+        if bodies:
+            c = rule.Conditions.Body
+            c.Text = bodies
+            c.Enabled = True
+            changed.append(f"body -> {bodies}")
+        headers = _split_list(header_contains)
+        if headers:
+            c = rule.Conditions.MessageHeader
+            c.Text = headers
+            c.Enabled = True
+            changed.append(f"header -> {headers}")
+        tos = _split_list(sent_to)
+        if tos:
+            c = rule.Conditions.SentTo
+            while c.Recipients.Count > 0:   # replace, don't append
+                c.Recipients.Remove(1)
+            for addr in tos:
+                c.Recipients.Add(addr)
+            c.Recipients.ResolveAll()
+            c.Enabled = True
+            changed.append(f"sent-to -> {tos}")
+        if not_to is not None:
+            rule.Conditions.NotTo.Enabled = bool(not_to)
+            changed.append(f"not-to {'on' if not_to else 'off'}")
+
+        if target is not None:
+            act = rule.Actions.MoveToFolder
+            act.Enabled = True
+            _force_folder_putref(act, target)
+            changed.append(f"move to '{target.Name}'")
+        if assign_category:
+            act = rule.Actions.AssignToCategory
+            act.Categories = [assign_category]
+            act.Enabled = True
+            changed.append(f"category -> '{assign_category}'")
+        if delete is not None:
+            rule.Actions.Delete.Enabled = bool(delete)
+            changed.append(f"delete {'on' if delete else 'off'}")
+        if stop_processing is not None:
+            rule.Actions.Stop.Enabled = bool(stop_processing)
+            changed.append(f"stop {'on' if stop_processing else 'off'}")
+
+        if not changed:
+            return "Error: nothing to update — specify at least one facet to change."
+
+        logger.warning("update_rule: modifying '%s' (%s)", rule_name,
+                        "; ".join(changed))
+        rules.Save()
+        return f"Rule '{rule_name}' updated.\nChanged: {'; '.join(changed)}"
+
+    try:
+        return await bridge.call(
+            _update, rule_name, move_to_folder, from_addresses, subject_contains,
+            body_contains, header_contains, sent_to, assign_category, not_to,
+            delete, stop_processing, account,
+        )
+    except Exception as e:
+        return f"Error updating rule: {format_com_error(e)}"
 
 
 # =====================================================================
