@@ -2675,6 +2675,68 @@ async def run_rule_now(
         return f"Error running rule: {format_com_error(e)}"
 
 
+@mcp.tool()
+async def reorder_rule(rule_name: str, position: int, account: str = "") -> str:
+    """Move a rule to a new position in the execution order.
+
+    Rules run top-down by ExecutionOrder (1 = runs first); position decides which
+    rule wins when several match (e.g. a specific rule before a catch-all, or
+    before one that stops processing).
+
+    CAUTION: modifies live rules immediately. Like every rule write this re-saves
+    the WHOLE rule set, so do NOT run it while you are editing rules in the
+    Outlook Rules Wizard — a concurrent edit could be clobbered.
+
+    Args:
+        rule_name: Exact name of the rule to move. Use list_rules to confirm.
+        position: New 1-based position in the execution order (1 = runs first).
+            Must be within 1..number-of-rules; other rules shift to make room.
+        account: Optional. Account display name (or substring) to target.
+
+    Returns:
+        Confirmation with the old and new position, or an error.
+    """
+    def _reorder(outlook, namespace, rule_name, position, account):
+        store = _require_store(namespace, account)
+        rules = store.GetRules()
+        count = rules.Count
+        # ExecutionOrder must be in 1..count; out-of-range raises a COM
+        # "parameter is incorrect" error, so validate up front.
+        if position < 1 or position > count:
+            return f"Error: position {position} out of range (1..{count})."
+
+        rule = None
+        for i in range(1, count + 1):
+            if rules.Item(i).Name == rule_name:
+                rule = rules.Item(i)
+                break
+        if rule is None:
+            return (f"Error: Rule '{rule_name}' not found. "
+                    "Use list_rules to see available rules.")
+
+        old = rule.ExecutionOrder
+        if old == position:
+            return f"Rule '{rule_name}' is already at position {position}."
+
+        logger.warning("reorder_rule: '%s' %d -> %d", rule_name, old, position)
+        rule.ExecutionOrder = position
+        rules.Save()
+
+        # Re-read to report the order actually applied.
+        fresh = store.GetRules()
+        new_pos = position
+        for i in range(1, fresh.Count + 1):
+            if fresh.Item(i).Name == rule_name:
+                new_pos = fresh.Item(i).ExecutionOrder
+                break
+        return f"Rule '{rule_name}' moved from position {old} to {new_pos}."
+
+    try:
+        return await bridge.call(_reorder, rule_name, position, account)
+    except Exception as e:
+        return f"Error reordering rule: {format_com_error(e)}"
+
+
 # =====================================================================
 # OUT OF OFFICE TOOLS
 # =====================================================================
