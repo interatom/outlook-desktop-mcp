@@ -739,8 +739,32 @@ async def reply_email(
 # TOOL 8: list_folders
 # =====================================================================
 
+def _folder_recency(folder):
+    """Return (last_received, oldest_received) datetimes for a mail folder, or
+    (None, None) for an empty folder or a non-mail folder (calendar/contacts/...).
+
+    Sorts the folder's items by ReceivedTime once (descending) and reads both
+    ends — cheap even for thousands of items (Outlook sorts natively).
+    """
+    try:
+        if folder.DefaultItemType != OL_MAIL_ITEM:
+            return None, None
+    except Exception:
+        return None, None
+    try:
+        items = folder.Items
+        if items.Count == 0:
+            return None, None
+        items.Sort("[ReceivedTime]", True)  # descending: GetFirst=newest, GetLast=oldest
+        return (getattr(items.GetFirst(), "ReceivedTime", None),
+                getattr(items.GetLast(), "ReceivedTime", None))
+    except Exception:
+        return None, None
+
+
 @mcp.tool()
-async def list_folders(folder: str = "", max_depth: int = 3, account: str = "") -> str:
+async def list_folders(folder: str = "", max_depth: int = 3,
+                       include_dates: bool = False, account: str = "") -> str:
     """List mail folders in the user's Outlook mailbox.
 
     When called with no folder argument, lists top-level folders. Provide a
@@ -759,14 +783,21 @@ async def list_folders(folder: str = "", max_depth: int = 3, account: str = "") 
             ("sent", "drafts"). When empty, lists from the mailbox root.
         max_depth: How many levels deep to recurse below the starting folder.
             Default 3. Set to 1 to see only immediate children.
+        include_dates: Optional. When True, each mail folder also gets
+            `last_received` and `oldest_received` (newest/oldest message
+            ReceivedTime, null for empty or non-mail folders). One recursive
+            call then answers "which folders have gone quiet?" without a
+            per-folder loop. Off by default — it sorts each folder's items, so
+            only request it when you need the recency signal.
         account: Optional. Account display name (or substring) to target.
             Default: primary account. Use list_accounts to see available accounts.
 
     Returns:
         JSON array of folder objects with name, full_path, item_count,
-        unread_count, and subfolders (if any).
+        unread_count, subfolders (if any), and — when include_dates=True —
+        last_received / oldest_received.
     """
-    def _list(outlook, namespace, folder, max_depth, account):
+    def _list(outlook, namespace, folder, max_depth, include_dates, account):
         max_depth = min(max(1, max_depth), 10)
         store = _require_store(namespace, account)
 
@@ -787,6 +818,10 @@ async def list_folders(folder: str = "", max_depth: int = 3, account: str = "") 
                 "item_count": f.Items.Count,
                 "unread_count": f.UnReadItemCount,
             }
+            if include_dates:
+                last, oldest = _folder_recency(f)
+                result["last_received"] = last
+                result["oldest_received"] = oldest
             if depth < max_depth:
                 children = []
                 for i in range(f.Folders.Count):
@@ -809,7 +844,7 @@ async def list_folders(folder: str = "", max_depth: int = 3, account: str = "") 
         return json.dumps(folders, indent=2, default=str)
 
     try:
-        return await bridge.call(_list, folder, max_depth, account)
+        return await bridge.call(_list, folder, max_depth, include_dates, account)
     except Exception as e:
         return f"Error listing folders: {format_com_error(e)}"
 
