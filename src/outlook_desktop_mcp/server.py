@@ -22,6 +22,8 @@ import os
 
 from outlook_desktop_mcp.tools._folder_constants import (
     FOLDER_NAME_TO_ENUM,
+    BUSY_STATUS_FROM_NAME,
+    BUSY_STATUS_NAMES,
     OL_MAIL_ITEM,
     OL_APPOINTMENT_ITEM,
     OL_FOLDER_CALENDAR,
@@ -1073,6 +1075,7 @@ async def create_event(
     location: str = "",
     body: str = "",
     all_day: bool = False,
+    show_as: str = "",
     reminder_minutes: int = 15,
     account: str = "",
 ) -> str:
@@ -1093,6 +1096,12 @@ async def create_event(
             "Microsoft Teams Meeting").
         body: Optional. Description or notes for the event.
         all_day: If true, creates an all-day event. Default false.
+        show_as: Optional. How the time appears in free/busy:
+            "free", "tentative", "busy", "out_of_office", "working_elsewhere"
+            (aliases: "oof"/"ooo"/"away" -> out_of_office). If omitted,
+            Outlook's default applies — which for all-day events is "free"
+            (i.e. does NOT block your calendar). Set "out_of_office" for a
+            vacation/absence block, or "busy" to reserve time.
         reminder_minutes: Minutes before the event to show a reminder.
             Default 15. Set to 0 to disable reminder.
         account: Optional. Account display name (or substring) to create
@@ -1102,7 +1111,7 @@ async def create_event(
         Confirmation with event subject and entry_id, or an error.
     """
     def _create(outlook, namespace, subject, start, end, location, body,
-                all_day, reminder_minutes, account):
+                all_day, show_as, reminder_minutes, account):
         appt = outlook.CreateItem(OL_APPOINTMENT_ITEM)
         # Move to correct store's calendar if account specified
         if account:
@@ -1118,6 +1127,16 @@ async def create_event(
         if body:
             appt.Body = body
         appt.AllDayEvent = all_day
+        # Set BusyStatus AFTER AllDayEvent: toggling AllDayEvent resets
+        # BusyStatus to free, so this must come last to stick.
+        if show_as:
+            key = show_as.strip().lower().replace(" ", "_").replace("-", "_")
+            if key not in BUSY_STATUS_FROM_NAME:
+                raise ValueError(
+                    f"Invalid show_as '{show_as}'. Valid: free, tentative, "
+                    f"busy, out_of_office, working_elsewhere."
+                )
+            appt.BusyStatus = BUSY_STATUS_FROM_NAME[key]
         if reminder_minutes > 0:
             appt.ReminderSet = True
             appt.ReminderMinutesBeforeStart = reminder_minutes
@@ -1129,13 +1148,15 @@ async def create_event(
             "subject": appt.Subject,
             "start": str(appt.Start),
             "end": str(appt.End),
+            "all_day": bool(appt.AllDayEvent),
+            "show_as": BUSY_STATUS_NAMES.get(appt.BusyStatus, "unknown"),
             "entry_id": appt.EntryID,
         }, indent=2, default=str)
 
     try:
         return await bridge.call(
             _create, subject, start, end, location, body, all_day,
-            reminder_minutes, account,
+            show_as, reminder_minutes, account,
         )
     except Exception as e:
         return f"Error creating event: {format_com_error(e)}"

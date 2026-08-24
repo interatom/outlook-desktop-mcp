@@ -54,6 +54,21 @@ BUSY_STATUS_NAMES = {
     3: "out_of_office", 4: "working_elsewhere",
 }
 
+# Reverse map for WRITING BusyStatus from a friendly name (with aliases).
+# Keys are normalized: lower-cased, spaces/hyphens -> underscores.
+BUSY_STATUS_FROM_NAME = {
+    "free": OL_BUSY_FREE,
+    "tentative": OL_BUSY_TENTATIVE,
+    "busy": OL_BUSY_BUSY,
+    "out_of_office": OL_BUSY_OUT_OF_OFFICE,
+    "outofoffice": OL_BUSY_OUT_OF_OFFICE,
+    "oof": OL_BUSY_OUT_OF_OFFICE,
+    "ooo": OL_BUSY_OUT_OF_OFFICE,
+    "away": OL_BUSY_OUT_OF_OFFICE,
+    "working_elsewhere": OL_BUSY_WORKING_ELSEWHERE,
+    "elsewhere": OL_BUSY_WORKING_ELSEWHERE,
+}
+
 MEETING_STATUS_NAMES = {
     0: "appointment", 1: "meeting", 3: "received", 5: "canceled",
 }

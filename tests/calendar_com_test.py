@@ -211,6 +211,45 @@ def test_search_events(namespace, keyword="MCP"):
     log(f"  Found {count} events matching '{keyword}'")
 
 
+def test_create_allday_out_of_office(outlook, namespace):
+    """Test 8: create_event's show_as path — an all-day event must be able to
+    show as Out of Office.
+
+    Guards two behaviours create_event relies on:
+      1. All-day appointments default to BusyStatus=Free (0) in Outlook, so a
+         caller MUST be able to override the free/busy state.
+      2. BusyStatus has to be set AFTER AllDayEvent=True — toggling AllDayEvent
+         resets BusyStatus to Free, which is exactly the ordering create_event
+         uses internally.
+    Self-cleaning: deletes its own appointment even if the assertion fails.
+    """
+    OL_BUSY_OUT_OF_OFFICE = 3
+    appt = outlook.CreateItem(1)  # olAppointmentItem
+    start = datetime.now() + timedelta(days=5)
+
+    appt.Subject = "Outlook Desktop MCP - show_as OOF Test"
+    appt.AllDayEvent = True
+    appt.Start = start.strftime("%Y-%m-%d")
+    appt.End = (start + timedelta(days=1)).strftime("%Y-%m-%d")
+    appt.BusyStatus = OL_BUSY_OUT_OF_OFFICE  # set AFTER AllDayEvent
+    appt.ReminderSet = False
+    appt.Save()
+    entry_id = appt.EntryID
+
+    try:
+        reread = namespace.GetItemFromID(entry_id)
+        log(f"  AllDay={reread.AllDayEvent}  BusyStatus={reread.BusyStatus}")
+        assert reread.AllDayEvent, "expected an all-day event"
+        assert reread.BusyStatus == OL_BUSY_OUT_OF_OFFICE, (
+            f"expected BusyStatus={OL_BUSY_OUT_OF_OFFICE} (out_of_office), "
+            f"got {reread.BusyStatus}"
+        )
+        log("  Verified: all-day event persists as Out of Office")
+    finally:
+        namespace.GetItemFromID(entry_id).Delete()
+        log("  Cleaned up test appointment")
+
+
 def main():
     log("=" * 60)
     log("Outlook Desktop MCP - Calendar COM Validation")
@@ -234,6 +273,8 @@ def main():
         ("Update Event", lambda: test_update_event(namespace)),
         ("Delete Event", lambda: test_delete_event(namespace)),
         ("Search Events", lambda: test_search_events(namespace)),
+        ("Create All-Day Out-of-Office (show_as)",
+         lambda: test_create_allday_out_of_office(outlook, namespace)),
     ]
 
     passed = 1  # Test 0 already passed
