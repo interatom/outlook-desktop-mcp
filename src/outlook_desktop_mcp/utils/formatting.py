@@ -23,19 +23,77 @@ def strip_html(html: str) -> str:
     return text
 
 
-def format_email_summary(item) -> dict:
-    """Extract key fields from an Outlook MailItem into a dict."""
-    return {
-        "entry_id": item.EntryID,
-        "subject": item.Subject or "(no subject)",
-        "sender": getattr(item, "SenderEmailAddress", "unknown"),
-        "sender_name": getattr(item, "SenderName", "unknown"),
-        "received_time": str(item.ReceivedTime),
-        "unread": bool(item.UnRead),
-        "flag_status": FLAG_STATUS_NAMES.get(getattr(item, "FlagStatus", 0), "none"),
-        "has_attachments": bool(item.Attachments.Count > 0),
-        "attachment_count": item.Attachments.Count,
-    }
+# Field name -> reader, applied lazily on purpose: every property access
+# crosses the COM process boundary, so a field that was not requested must not
+# be read at all. Field selection is therefore a latency win, not only a
+# payload win. Note has_attachments and attachment_count share a single
+# Attachments.Count call instead of making two.
+EMAIL_SUMMARY_FIELDS = (
+    "entry_id",
+    "subject",
+    "sender",
+    "sender_name",
+    "received_time",
+    "unread",
+    "flag_status",
+    "has_attachments",
+    "attachment_count",
+)
+
+
+def format_email_summary(item, fields=None) -> dict:
+    """Extract key fields from an Outlook MailItem into a dict.
+
+    fields: optional iterable of field names to include. None (the default)
+        returns every field, matching the historical behaviour.
+    """
+    wanted = EMAIL_SUMMARY_FIELDS if fields is None else frozenset(fields)
+    out = {}
+
+    if "entry_id" in wanted:
+        out["entry_id"] = item.EntryID
+    if "subject" in wanted:
+        out["subject"] = item.Subject or "(no subject)"
+    if "sender" in wanted:
+        out["sender"] = getattr(item, "SenderEmailAddress", "unknown")
+    if "sender_name" in wanted:
+        out["sender_name"] = getattr(item, "SenderName", "unknown")
+    if "received_time" in wanted:
+        out["received_time"] = str(item.ReceivedTime)
+    if "unread" in wanted:
+        out["unread"] = bool(item.UnRead)
+    if "flag_status" in wanted:
+        out["flag_status"] = FLAG_STATUS_NAMES.get(getattr(item, "FlagStatus", 0), "none")
+    if "has_attachments" in wanted or "attachment_count" in wanted:
+        n = item.Attachments.Count
+        if "has_attachments" in wanted:
+            out["has_attachments"] = bool(n > 0)
+        if "attachment_count" in wanted:
+            out["attachment_count"] = n
+
+    # Keep the declared order regardless of the order the caller asked in.
+    return {k: out[k] for k in EMAIL_SUMMARY_FIELDS if k in out}
+
+
+def parse_summary_fields(spec: str):
+    """Turn a comma-separated field spec into a validated tuple.
+
+    Returns (fields, error). An empty spec yields (None, None), i.e. all
+    fields. An unknown name is a hard error rather than a silent drop, so a
+    typo cannot quietly remove data the caller expected.
+    """
+    if not spec or not spec.strip():
+        return None, None
+    names = [p.strip() for p in spec.split(",") if p.strip()]
+    if not names:
+        return None, None
+    unknown = [n for n in names if n not in EMAIL_SUMMARY_FIELDS]
+    if unknown:
+        return None, (
+            f"Unknown field(s): {', '.join(unknown)}. "
+            f"Valid: {', '.join(EMAIL_SUMMARY_FIELDS)}"
+        )
+    return tuple(dict.fromkeys(names)), None
 
 
 def format_email_full(item, body_max_length: int = 5000) -> dict:

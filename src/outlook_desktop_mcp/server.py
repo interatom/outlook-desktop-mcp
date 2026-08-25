@@ -49,8 +49,15 @@ from outlook_desktop_mcp.utils.formatting import (
     format_event_full,
     format_task_summary,
     format_task_full,
+    parse_summary_fields,
 )
 from outlook_desktop_mcp.utils.errors import format_com_error
+
+# Hard ceiling on how many items any listing tool will return. Callers cannot
+# raise it; a larger request is clamped, which is why the response carries a
+# "truncated" flag -- without it a clamped result is indistinguishable from a
+# complete one.
+MAX_ITEM_COUNT = 200
 
 # --- Logging (all to stderr, stdout is reserved for MCP JSON-RPC) ---
 
@@ -60,6 +67,25 @@ logging.basicConfig(
     stream=sys.stderr,
 )
 logger = logging.getLogger("outlook_desktop_mcp")
+
+
+# --- Response helpers ---
+
+def _summary_envelope(results, total):
+    """Wrap email summaries with completeness metadata.
+
+    A clamped or count-limited listing is otherwise indistinguishable from a
+    complete one: the caller sees N items and nothing else. "truncated" plus
+    "oldest_returned" make the cut-off visible and give the caller the exact
+    cursor to page backwards with (pass it as end_date).
+    """
+    return {
+        "emails": results,
+        "returned": len(results),
+        "total_matching": total,
+        "truncated": total > len(results),
+        "oldest_returned": results[-1].get("received_time", "") if results else "",
+    }
 
 
 # --- Security helpers ---
@@ -350,12 +376,12 @@ async def list_emails(
     start_date: str = "",
     end_date: str = "",
     account: str = "",
+    fields: str = "",
 ) -> str:
     """List recent emails from a specified Outlook folder.
 
-    Returns a JSON array of email summaries sorted by received time (newest
-    first). Each summary includes entry_id, subject, sender, sender_name,
-    received_time, unread status, and attachment info.
+    Returns a JSON object: "emails" holds the summaries sorted by received time
+    (newest first), alongside metadata describing the completeness of that list.
 
     Use the entry_id from results to read full content with read_email,
     or to perform actions like mark_as_read, move_email, or reply_email.
@@ -365,7 +391,9 @@ async def list_emails(
             "sent"/"sentmail", "drafts", "deleted"/"trash", "junk"/"spam",
             "outbox", "archive", or any custom folder name visible in
             list_folders output.
-        count: Maximum number of emails to return. Default 10, max recommended 50.
+        count: Maximum number of emails to return. Default 10. Values above
+            200 are clamped to 200 -- see "truncated" in the response, and
+            paginate with end_date rather than raising count.
         unread_only: If true, only return unread emails. Default false.
         start_date: Optional. Only return emails received on or after this date.
             ISO 8601 format (e.g. "2026-03-10" or "2026-03-10 09:00").
@@ -373,12 +401,33 @@ async def list_emails(
             ISO 8601 format. Default: now (if start_date is provided).
         account: Optional. Account display name (or substring) to target.
             Default: primary account. Use list_accounts to see available accounts.
+        fields: Optional comma-separated subset of summary fields to return,
+            e.g. "subject,sender_name,received_time". Default: all fields.
+            Omitted fields are never read from Outlook, so narrowing the set
+            reduces latency as well as response size -- entry_id alone is
+            140 characters per mail. An unknown name is rejected rather than
+            silently dropped. Valid: entry_id, subject, sender, sender_name,
+            received_time, unread, flag_status, has_attachments,
+            attachment_count.
 
     Returns:
-        JSON array of email summary objects.
+        JSON object with:
+          emails          - array of email summary objects
+          returned        - number of summaries in "emails"
+          total_matching  - how many items matched the filter in the folder
+          truncated       - true when total_matching > returned, i.e. the
+                            window is cut off and older mail was not returned
+          oldest_returned - received_time of the last element. Pass it back as
+                            end_date to page backwards. Empty when the list is
+                            empty, or when "fields" excluded received_time --
+                            keep that field if you intend to paginate.
     """
-    def _list(outlook, namespace, folder, count, unread_only, start_date, end_date, account):
-        count = min(max(1, count), 200)
+    def _list(outlook, namespace, folder, count, unread_only, start_date, end_date, account,
+              fields):
+        count = min(max(1, count), MAX_ITEM_COUNT)
+        selected, field_error = parse_summary_fields(fields)
+        if field_error:
+            return json.dumps({"error": field_error})
         store = _require_store(namespace, account)
         target = _resolve_folder(namespace, folder, store)
         if not target:
@@ -404,17 +453,20 @@ async def list_emails(
         if restrictions:
             items = items.Restrict(" AND ".join(restrictions))
 
+        total = items.Count
         results = []
-        limit = min(count, items.Count)
+        limit = min(count, total)
         for i in range(limit):
             try:
-                results.append(format_email_summary(items.Item(i + 1)))
+                results.append(format_email_summary(items.Item(i + 1), selected))
             except Exception:
                 continue
-        return json.dumps(results, indent=2, default=str)
+        return json.dumps(_summary_envelope(results, total), indent=2, default=str)
 
     try:
-        return await bridge.call(_list, folder, count, unread_only, start_date, end_date, account)
+        return await bridge.call(
+            _list, folder, count, unread_only, start_date, end_date, account, fields
+        )
     except Exception as e:
         return f"Error listing emails: {format_com_error(e)}"
 
@@ -863,6 +915,7 @@ async def search_emails(
     start_date: str = "",
     end_date: str = "",
     account: str = "",
+    fields: str = "",
 ) -> str:
     """Search for emails in Outlook using text search.
 
@@ -875,19 +928,27 @@ async def search_emails(
             Examples: "budget report", "meeting notes", "quarterly".
         folder: Folder to search in. Default "inbox". Supports same
             names as list_emails.
-        count: Maximum results to return. Default 10.
+        count: Maximum results to return. Default 10. Values above 200 are
+            clamped to 200 -- see "truncated" in the response.
         start_date: Optional. Only return emails received on or after this date.
             ISO 8601 format (e.g. "2026-03-10" or "2026-03-10 09:00").
         end_date: Optional. Only return emails received on or before this date.
             ISO 8601 format. Default: now (if start_date is provided).
         account: Optional. Account display name (or substring) to target.
             Default: primary account. Use list_accounts to see available accounts.
+        fields: Optional comma-separated subset of summary fields, as in
+            list_emails. Default: all fields.
 
     Returns:
-        JSON array of matching email summaries, or an error.
+        JSON object with the same shape as list_emails: emails, returned,
+        total_matching, truncated, oldest_returned.
     """
-    def _search(outlook, namespace, query, folder, count, start_date, end_date, account):
-        count = min(max(1, count), 200)
+    def _search(outlook, namespace, query, folder, count, start_date, end_date, account,
+                fields):
+        count = min(max(1, count), MAX_ITEM_COUNT)
+        selected, field_error = parse_summary_fields(fields)
+        if field_error:
+            return json.dumps({"error": field_error})
         store = _require_store(namespace, account)
         target = _resolve_folder(namespace, folder, store)
         if not target:
@@ -917,17 +978,20 @@ async def search_emails(
         items = target.Items.Restrict(filter_str)
         items.Sort("[ReceivedTime]", True)
 
+        total = items.Count
         results = []
-        limit = min(count, items.Count)
+        limit = min(count, total)
         for i in range(limit):
             try:
-                results.append(format_email_summary(items.Item(i + 1)))
+                results.append(format_email_summary(items.Item(i + 1), selected))
             except Exception:
                 continue
-        return json.dumps(results, indent=2, default=str)
+        return json.dumps(_summary_envelope(results, total), indent=2, default=str)
 
     try:
-        return await bridge.call(_search, query, folder, count, start_date, end_date, account)
+        return await bridge.call(
+            _search, query, folder, count, start_date, end_date, account, fields
+        )
     except Exception as e:
         return f"Error searching emails: {format_com_error(e)}"
 
