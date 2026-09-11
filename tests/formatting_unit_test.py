@@ -168,8 +168,39 @@ def test_envelope_cursor_empty_without_received_time():
     log("  cursor is empty when received_time was not selected")
 
 
+def test_no_hardcoded_us_date_format_in_filters():
+    """Regression guard for the de-DE month/day swap in the MAIL date filters.
+
+    Outlook's Restrict() and its DASL variant parse date strings with the
+    Windows system locale. list_emails / search_emails formatted theirs as
+    '%m/%d/%Y', so on a de-DE box '2026-09-11' went over the wire as
+    '09/11/2026' and came back read as 9 November. Measured 2026-09-11:
+    start_date='2026-09-11' returned 0 mails while start_date='2026-11-09'
+    returned that day's 10 -- same tool, same day, inverted spelling.
+
+    The bug only shows when the day is <= 12; above that there is no such
+    month and Outlook falls back to the right reading, which is why earlier
+    checks on e.g. 2026-08-17 kept declaring it fixed. A value-level test
+    would have to pin a locale to mean anything, so this guards the source
+    instead: every date handed to a filter must go through
+    _date_to_restrict_str, which formats in the locale's own order.
+    """
+    from pathlib import Path
+    server_py = (
+        Path(__file__).resolve().parent.parent
+        / "src" / "outlook_desktop_mcp" / "server.py"
+    )
+    source = server_py.read_text(encoding="utf-8")
+    assert "%m/%d/%Y" not in source, (
+        "server.py hardcodes the US date order somewhere. Outlook parses "
+        "Restrict/DASL dates by system locale -- use _date_to_restrict_str()."
+    )
+    log("  no hardcoded US date order in server.py")
+
+
 def main():
     tests = [
+        ("No hardcoded US date format", test_no_hardcoded_us_date_format_in_filters),
         ("Default returns all fields", test_default_returns_all_fields),
         ("Subset selects and orders", test_subset_selects_and_orders),
         ("Unrequested fields are not read", test_unrequested_fields_are_not_read),

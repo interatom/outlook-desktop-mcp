@@ -442,13 +442,13 @@ async def list_emails(
             restrictions.append("[UnRead] = True")
         if start_date:
             start = _parse_date(start_date)
-            restrictions.append(f"[ReceivedTime] >= '{start.strftime('%m/%d/%Y %H:%M')}'")
+            restrictions.append(f"[ReceivedTime] >= '{_date_to_restrict_str(start)}'")
         if end_date:
             end = _parse_date(end_date)
-            restrictions.append(f"[ReceivedTime] <= '{end.strftime('%m/%d/%Y %H:%M')}'")
+            restrictions.append(f"[ReceivedTime] <= '{_date_to_restrict_str(end)}'")
         elif start_date:
             # Default end to now when start is specified
-            restrictions.append(f"[ReceivedTime] <= '{datetime.now().strftime('%m/%d/%Y %H:%M')}'")
+            restrictions.append(f"[ReceivedTime] <= '{_date_to_restrict_str(datetime.now())}'")
 
         if restrictions:
             items = items.Restrict(" AND ".join(restrictions))
@@ -962,16 +962,16 @@ async def search_emails(
         if start_date:
             start = _parse_date(start_date)
             dasl_parts.append(
-                f"\"urn:schemas:httpmail:datereceived\" >= '{start.strftime('%m/%d/%Y %H:%M')}'"
+                f"\"urn:schemas:httpmail:datereceived\" >= '{_date_to_restrict_str(start)}'"
             )
         if end_date:
             end = _parse_date(end_date)
             dasl_parts.append(
-                f"\"urn:schemas:httpmail:datereceived\" <= '{end.strftime('%m/%d/%Y %H:%M')}'"
+                f"\"urn:schemas:httpmail:datereceived\" <= '{_date_to_restrict_str(end)}'"
             )
         elif start_date:
             dasl_parts.append(
-                f"\"urn:schemas:httpmail:datereceived\" <= '{datetime.now().strftime('%m/%d/%Y %H:%M')}'"
+                f"\"urn:schemas:httpmail:datereceived\" <= '{_date_to_restrict_str(datetime.now())}'"
             )
 
         filter_str = "@SQL=" + " AND ".join(dasl_parts)
@@ -1014,6 +1014,14 @@ def _date_to_restrict_str(dt: datetime) -> str:
     Outlook's COM Restrict() parses date strings using the Windows system locale.
     Using %x (locale's preferred short date) ensures day/month order matches,
     avoiding the MM/DD vs DD/MM swap on non-US locales (e.g. de-DE).
+
+    Used by the mail tools as well as the calendar ones (it is defined here for
+    historical reasons; both call it via late binding). Every date that goes
+    into a Restrict() or DASL filter MUST pass through this — a hardcoded
+    month-first format silently shifts the window whenever the day is <= 12,
+    and reads correctly above that, which makes the bug look intermittent. The
+    regression guard in tests/formatting_unit_test.py scans this file for such
+    a literal, so do not reintroduce one, not even in a comment.
     """
     saved = _locale.getlocale(_locale.LC_TIME)
     try:
