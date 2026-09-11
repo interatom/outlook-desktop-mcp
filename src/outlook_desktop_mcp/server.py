@@ -16,6 +16,7 @@ from mcp.server.fastmcp import FastMCP
 
 from outlook_desktop_mcp.com_bridge import OutlookBridge
 from datetime import datetime, timedelta
+import ctypes
 import locale as _locale
 
 import os
@@ -1008,27 +1009,80 @@ def _parse_date(date_str: str) -> datetime:
     return datetime.fromisoformat(date_str)
 
 
-def _date_to_restrict_str(dt: datetime) -> str:
-    """Format datetime for Outlook Restrict() using the system locale's date order.
+class _SYSTEMTIME(ctypes.Structure):
+    """Win32 SYSTEMTIME, declared with plain ctypes so it imports off-Windows too."""
+    _fields_ = [
+        ("wYear", ctypes.c_ushort),
+        ("wMonth", ctypes.c_ushort),
+        ("wDayOfWeek", ctypes.c_ushort),
+        ("wDay", ctypes.c_ushort),
+        ("wHour", ctypes.c_ushort),
+        ("wMinute", ctypes.c_ushort),
+        ("wSecond", ctypes.c_ushort),
+        ("wMilliseconds", ctypes.c_ushort),
+    ]
 
-    Outlook's COM Restrict() parses date strings using the Windows system locale.
-    Using %x (locale's preferred short date) ensures day/month order matches,
-    avoiding the MM/DD vs DD/MM swap on non-US locales (e.g. de-DE).
 
-    Used by the mail tools as well as the calendar ones (it is defined here for
-    historical reasons; both call it via late binding). Every date that goes
-    into a Restrict() or DASL filter MUST pass through this — a hardcoded
-    month-first format silently shifts the window whenever the day is <= 12,
-    and reads correctly above that, which makes the bug look intermittent. The
-    regression guard in tests/formatting_unit_test.py scans this file for such
-    a literal, so do not reintroduce one, not even in a comment.
+_LOCALE_USER_DEFAULT = 0x0400
+_DATE_SHORTDATE = 0x00000001
+_TIME_NOSECONDS = 0x00000002
+
+
+def _win32_regional_datetime(dt: datetime) -> str:
+    """Render dt with the Windows REGIONAL short date and time settings.
+
+    This is the same source Outlook's own parser reads the literal back with,
+    so the value round-trips regardless of how the user has configured their
+    short date format. Raises when the API is unavailable (non-Windows) or
+    fails, so callers can fall back.
     """
-    saved = _locale.getlocale(_locale.LC_TIME)
+    kernel32 = ctypes.windll.kernel32
+    st = _SYSTEMTIME(dt.year, dt.month, 0, dt.day, dt.hour, dt.minute, dt.second, 0)
+
+    date_buf = ctypes.create_unicode_buffer(128)
+    if not kernel32.GetDateFormatW(
+        _LOCALE_USER_DEFAULT, _DATE_SHORTDATE, ctypes.byref(st), None, date_buf, 128
+    ):
+        raise OSError("GetDateFormatW failed")
+
+    time_buf = ctypes.create_unicode_buffer(128)
+    if not kernel32.GetTimeFormatW(
+        _LOCALE_USER_DEFAULT, _TIME_NOSECONDS, ctypes.byref(st), None, time_buf, 128
+    ):
+        raise OSError("GetTimeFormatW failed")
+
+    return f"{date_buf.value} {time_buf.value}"
+
+
+def _date_to_restrict_str(dt: datetime) -> str:
+    """Format datetime for Outlook Restrict()/DASL in the user's regional format.
+
+    Outlook parses these literals with the Windows regional settings, so the
+    literal has to be produced from that same source. A hardcoded month-first
+    format silently shifts the window whenever day and month are both <= 12 and
+    reads correctly above that, which is what makes the bug look intermittent —
+    and is why the regression guard in tests/formatting_unit_test.py scans this
+    file for such a literal. Do not reintroduce one, not even in a comment.
+
+    Primary path is GetDateFormatW / GetTimeFormatW with LOCALE_USER_DEFAULT.
+    The fallback is the C runtime's locale via %x, which is merely seeded from
+    the system: it agrees with Windows on stock configurations but drifts apart
+    as soon as the user customises their short date format, which would bring
+    the swap back. It exists so the module still works where the Win32 API does
+    not (tests importing this on non-Windows).
+
+    Used by the mail tools as well as the calendar ones — it is defined in the
+    calendar section for historical reasons and reached via late binding.
+    """
     try:
-        _locale.setlocale(_locale.LC_TIME, "")
-        return dt.strftime("%x %H:%M")
-    finally:
-        _locale.setlocale(_locale.LC_TIME, saved)
+        return _win32_regional_datetime(dt)
+    except Exception:
+        saved = _locale.getlocale(_locale.LC_TIME)
+        try:
+            _locale.setlocale(_locale.LC_TIME, "")
+            return dt.strftime("%x %H:%M")
+        finally:
+            _locale.setlocale(_locale.LC_TIME, saved)
 
 
 # =====================================================================
