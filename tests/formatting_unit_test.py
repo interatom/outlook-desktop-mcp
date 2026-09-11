@@ -198,9 +198,41 @@ def test_no_hardcoded_us_date_format_in_filters():
     log("  no hardcoded US date order in server.py")
 
 
+def test_restrict_date_order_survives_ambiguity():
+    """An ambiguous date must use the same component order as an unambiguous one.
+
+    This is the whole bug in one sentence: the old formatter got 2026-08-17
+    right (no month 17, so Outlook corrected it) and 2026-09-11 wrong. So the
+    test does not need to know the machine's locale — it reads the true order
+    off a date whose day cannot be a month, then checks that a day <= 12 lands
+    in the same slot.
+    """
+    import re as _re
+    from datetime import datetime as _datetime
+    from outlook_desktop_mcp.server import _date_to_restrict_str
+
+    def numeric_parts(formatted):
+        date_part = formatted.split(" ")[0]
+        tokens = [t for t in _re.split(r"\D+", date_part) if t]
+        return [t for t in tokens if t not in ("2026", "26")]
+
+    probe = numeric_parts(_date_to_restrict_str(_datetime(2026, 9, 25, 13, 5)))
+    assert "25" in probe, f"day missing from formatted date: {probe}"
+    day_slot = probe.index("25")
+
+    ambiguous = numeric_parts(_date_to_restrict_str(_datetime(2026, 9, 11, 13, 5)))
+    assert len(ambiguous) == len(probe), f"component count changed: {ambiguous} vs {probe}"
+    assert ambiguous[day_slot] == "11", (
+        f"day/month order flipped for an ambiguous date: {ambiguous} "
+        f"(day was in slot {day_slot} for the unambiguous probe {probe})"
+    )
+    log(f"  day stays in slot {day_slot}: {probe} -> {ambiguous}")
+
+
 def main():
     tests = [
         ("No hardcoded US date format", test_no_hardcoded_us_date_format_in_filters),
+        ("Restrict date order survives ambiguity", test_restrict_date_order_survives_ambiguity),
         ("Default returns all fields", test_default_returns_all_fields),
         ("Subset selects and orders", test_subset_selects_and_orders),
         ("Unrequested fields are not read", test_unrequested_fields_are_not_read),
