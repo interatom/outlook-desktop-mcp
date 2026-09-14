@@ -127,14 +127,14 @@ Both permissions are one-time setup — macOS remembers them for future sessions
 
 | Tool | Windows | macOS | Description |
 |------|:-------:|:-----:|-------------|
-| `list_events` | yes | yes | List upcoming events within a date range |
+| `list_events` | yes | yes | List upcoming events within a date range; Windows: optional category filter |
 | `get_event` | yes | yes | Read full event details by entry ID |
-| `create_event` | yes | yes | Create a personal calendar appointment |
-| `create_meeting` | yes | yes | Create a meeting and send invitations to attendees |
-| `update_event` | yes | yes | Modify an existing event's subject, time, location, etc. |
+| `create_event` | yes | yes | Create a personal calendar appointment; Windows: optional categories |
+| `create_meeting` | yes | yes | Create a meeting and send invitations to attendees; Windows: optional categories |
+| `update_event` | yes | yes | Modify an existing event's subject, time, location, categories, etc. |
 | `delete_event` | yes | yes | Delete an appointment or cancel a meeting |
 | `respond_to_meeting` | yes | — | Accept, decline, or tentatively accept a meeting invite |
-| `search_events` | yes | yes | Search calendar events by keyword within a date range |
+| `search_events` | yes | yes | Search calendar events by keyword within a date range; Windows: optional category filter |
 
 ### Tasks
 
@@ -159,8 +159,11 @@ These tools rely on COM-specific APIs (MAPI property accessors, the Rules object
 
 | Tool | Windows | macOS | Description |
 |------|:-------:|:-----:|-------------|
-| `list_categories` | yes | — | List all available color categories in Outlook |
-| `set_category` | yes | — | Set or clear categories on any email, event, or task |
+| `list_categories` | yes | — | List the master list of color categories (name, color index, color name) |
+| `set_category` | yes | — | Set, add, or remove categories on any email, event, or task |
+| `create_category` | yes | — | Add a color category to the master list |
+| `rename_category` | yes | — | Rename a master-list entry (does NOT retag existing items) |
+| `delete_category` | yes | — | Remove a master-list entry (items keep the name, lose the color) |
 | `list_rules` | yes | — | List all mail rules with enabled/disabled status |
 | `toggle_rule` | yes | — | Enable or disable a mail rule by name |
 | `get_out_of_office` | yes | — | Check whether Out of Office auto-reply is on or off |

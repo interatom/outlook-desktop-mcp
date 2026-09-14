@@ -25,6 +25,8 @@ from outlook_desktop_mcp.tools._folder_constants import (
     FOLDER_NAME_TO_ENUM,
     BUSY_STATUS_FROM_NAME,
     BUSY_STATUS_NAMES,
+    CATEGORY_COLOR_FROM_NAME,
+    CATEGORY_COLOR_NAMES,
     OL_MAIL_ITEM,
     OL_APPOINTMENT_ITEM,
     OL_FOLDER_CALENDAR,
@@ -113,6 +115,67 @@ def _check_item_class(item, expected_class: int, label: str) -> str | None:
     return None
 
 
+# --- Helpers: color categories ---
+#
+# Outlook stores categories as ONE string per item -- there is no collection
+# to iterate, so every add/remove/match is string work on that field.
+#
+# The separator is the Windows LIST SEPARATOR, not a comma: on a de-DE box
+# Outlook writes "A; B" and on en-US "A, B". Measured 2026-09-14 -- an event
+# created with categories="Internal, MCP-Smoketest" read back as
+# "Internal; MCP-Smoketest". Splitting on "," alone therefore yields ONE
+# token on a German machine, which silently turns every add/remove into a
+# no-op and every category filter into an empty result. Both were observed
+# before this was fixed.
+#
+# So: accept either separator when reading (a value may have been written by
+# another client or locale), and emit the one this system actually uses.
+
+def _split_categories(value: str) -> list[str]:
+    """Split an Outlook category string into trimmed, non-empty names.
+
+    Accepts both separators Outlook uses across locales, so a value written
+    on one machine parses on another.
+    """
+    return [c.strip() for c in re.split(r"[;,]", value or "") if c.strip()]
+
+
+def _category_separator() -> str:
+    """The separator Outlook joins categories with on THIS system.
+
+    Read from the Windows regional settings, the same source Outlook uses --
+    see _win32_regional_datetime for the equivalent on dates. Falls back to a
+    comma where the API is unavailable (non-Windows, e.g. tests).
+    """
+    try:
+        kernel32 = ctypes.windll.kernel32
+        buf = ctypes.create_unicode_buffer(16)
+        if not kernel32.GetLocaleInfoW(
+            _LOCALE_USER_DEFAULT, _LOCALE_SLIST, buf, 16
+        ):
+            raise OSError("GetLocaleInfoW(LOCALE_SLIST) failed")
+        sep = (buf.value or "").strip()
+    except Exception:
+        sep = ""
+    return (sep or ",") + " "
+
+
+def _join_categories(names: list[str]) -> str:
+    """Render category names the way Outlook renders them on this system."""
+    return _category_separator().join(names)
+
+
+def _matches_any_category(item_categories: str, wanted: list[str]) -> bool:
+    """True if the item carries at least one of the wanted categories.
+
+    Case-insensitive. An empty `wanted` list means "no filter" -> True.
+    """
+    if not wanted:
+        return True
+    have = {c.lower() for c in _split_categories(item_categories)}
+    return any(w.lower() in have for w in wanted)
+
+
 # --- MCP Server ---
 
 mcp = FastMCP(
@@ -133,7 +196,8 @@ mcp = FastMCP(
         "- Calendar: list events, create appointments/meetings, update, delete, "
         "respond to invites, search events\n"
         "- Tasks: create, list, complete, update, delete to-do items\n"
-        "- Categories: list and set color categories on any item\n"
+        "- Categories: set/add/remove them on any item, and manage the master\n"
+        "  list itself (list, create, rename, delete)\n"
         "- Rules: list and manage mail rules\n"
         "- Out of Office: check auto-reply status\n"
         "- Folders: list folder hierarchy with item counts"
@@ -1026,6 +1090,7 @@ class _SYSTEMTIME(ctypes.Structure):
 _LOCALE_USER_DEFAULT = 0x0400
 _DATE_SHORTDATE = 0x00000001
 _TIME_NOSECONDS = 0x00000002
+_LOCALE_SLIST = 0x0000000C  # list separator; ";" on de-DE, "," on en-US
 
 
 def _win32_regional_datetime(dt: datetime) -> str:
@@ -1094,6 +1159,7 @@ async def list_events(
     start_date: str = "",
     end_date: str = "",
     count: int = 20,
+    categories: str = "",
     account: str = "",
 ) -> str:
     """List upcoming calendar events from Outlook.
@@ -1101,7 +1167,7 @@ async def list_events(
     Returns a JSON array of event summaries within a date range, sorted by
     start time. Includes recurring event occurrences. Each summary has
     entry_id, subject, start, end, duration, location, organizer, attendees,
-    and status info.
+    categories, and status info.
 
     Use entry_id from results with get_event, update_event, delete_event,
     or respond_to_meeting.
@@ -1111,14 +1177,18 @@ async def list_events(
             or "2026-02-25 09:00"). Default: now.
         end_date: End of date range. Default: 7 days from start_date.
         count: Maximum number of events to return. Default 20.
+        categories: Optional. Comma- or semicolon-separated color-category names. An event
+            is kept if it carries AT LEAST ONE of them (case-insensitive).
+            Example: "Kunde A, Reise". Default: no category filter.
         account: Optional. Account display name (or substring) to target.
             Default: primary account. Use list_accounts to see available accounts.
 
     Returns:
         JSON array of event summary objects.
     """
-    def _list(outlook, namespace, start_date, end_date, count, account):
+    def _list(outlook, namespace, start_date, end_date, count, categories, account):
         count = min(max(1, count), 200)
+        wanted = _split_categories(categories)
         store = _require_store(namespace, account)
         calendar = store.GetDefaultFolder(OL_FOLDER_CALENDAR)
         items = calendar.Items
@@ -1137,20 +1207,23 @@ async def list_events(
         filtered = items.Restrict(restrict)
 
         results = []
-        n = 0
         for item in filtered:
-            n += 1
             try:
-                results.append(format_event_summary(item))
+                summary = format_event_summary(item)
             except Exception:
                 continue
-            if n >= count:
+            if not _matches_any_category(summary["categories"], wanted):
+                continue
+            results.append(summary)
+            if len(results) >= count:
                 break
 
         return json.dumps(results, indent=2, default=str)
 
     try:
-        return await bridge.call(_list, start_date, end_date, count, account)
+        return await bridge.call(
+            _list, start_date, end_date, count, categories, account,
+        )
     except Exception as e:
         return f"Error listing events: {format_com_error(e)}"
 
@@ -1203,6 +1276,7 @@ async def create_event(
     all_day: bool = False,
     show_as: str = "",
     reminder_minutes: int = 15,
+    categories: str = "",
     account: str = "",
 ) -> str:
     """Create a personal calendar appointment (no attendees).
@@ -1230,6 +1304,10 @@ async def create_event(
             vacation/absence block, or "busy" to reserve time.
         reminder_minutes: Minutes before the event to show a reminder.
             Default 15. Set to 0 to disable reminder.
+        categories: Optional. Comma- or semicolon-separated color-category names to assign,
+            e.g. "Kunde A, Reise". Names that are not in the master list are
+            stored anyway and show up without a color — use list_categories
+            to see what exists.
         account: Optional. Account display name (or substring) to create
             the event in. Default: primary account.
 
@@ -1237,7 +1315,7 @@ async def create_event(
         Confirmation with event subject and entry_id, or an error.
     """
     def _create(outlook, namespace, subject, start, end, location, body,
-                all_day, show_as, reminder_minutes, account):
+                all_day, show_as, reminder_minutes, categories, account):
         appt = outlook.CreateItem(OL_APPOINTMENT_ITEM)
         # Move to correct store's calendar if account specified
         if account:
@@ -1268,6 +1346,8 @@ async def create_event(
             appt.ReminderMinutesBeforeStart = reminder_minutes
         else:
             appt.ReminderSet = False
+        if categories:
+            appt.Categories = _join_categories(_split_categories(categories))
         appt.Save()
         return json.dumps({
             "status": "created",
@@ -1276,13 +1356,14 @@ async def create_event(
             "end": str(appt.End),
             "all_day": bool(appt.AllDayEvent),
             "show_as": BUSY_STATUS_NAMES.get(appt.BusyStatus, "unknown"),
+            "categories": appt.Categories or "",
             "entry_id": appt.EntryID,
         }, indent=2, default=str)
 
     try:
         return await bridge.call(
             _create, subject, start, end, location, body, all_day,
-            show_as, reminder_minutes, account,
+            show_as, reminder_minutes, categories, account,
         )
     except Exception as e:
         return f"Error creating event: {format_com_error(e)}"
@@ -1301,6 +1382,7 @@ async def create_meeting(
     location: str = "",
     body: str = "",
     optional_attendees: str = "",
+    categories: str = "",
     account: str = "",
 ) -> str:
     """Create a meeting and send invitations to attendees.
@@ -1320,6 +1402,9 @@ async def create_meeting(
         body: Optional. Meeting description or agenda.
         optional_attendees: Optional. Optional attendee emails, separated
             by semicolons.
+        categories: Optional. Comma- or semicolon-separated color-category names for the
+            organizer's copy. Categories are local — attendees do not see
+            them and do not receive them with the invitation.
         account: Optional. Account display name (or substring) to send from.
             Default: primary account. Use list_accounts to see available accounts.
 
@@ -1327,7 +1412,7 @@ async def create_meeting(
         Confirmation that the meeting was created and invitations sent.
     """
     def _create(outlook, namespace, subject, start, end, required_attendees,
-                location, body, optional_attendees, account):
+                location, body, optional_attendees, categories, account):
         appt = outlook.CreateItem(OL_APPOINTMENT_ITEM)
         # Set sending account
         if account:
@@ -1344,6 +1429,8 @@ async def create_meeting(
             appt.Location = location
         if body:
             appt.Body = body
+        if categories:
+            appt.Categories = _join_categories(_split_categories(categories))
 
         for addr in required_attendees.split(";"):
             addr = addr.strip()
@@ -1368,7 +1455,7 @@ async def create_meeting(
     try:
         return await bridge.call(
             _create, subject, start, end, required_attendees, location, body,
-            optional_attendees, account,
+            optional_attendees, categories, account,
         )
     except Exception as e:
         return f"Error creating meeting: {format_com_error(e)}"
@@ -1386,6 +1473,7 @@ async def update_event(
     end: str = "",
     location: str = "",
     body: str = "",
+    categories: str = "",
     account: str = "",
 ) -> str:
     """Update an existing calendar event.
@@ -1401,13 +1489,18 @@ async def update_event(
         end: Optional. New end time in ISO 8601 format.
         location: Optional. New location.
         body: Optional. New description/notes.
+        categories: Optional. Comma- or semicolon-separated color-category names, replacing
+            whatever the event carries. To ADD or REMOVE single categories, or
+            to clear them all, use set_category — an empty string here means
+            "unchanged", like every other field.
         account: Optional. Account display name (or substring). Only needed
             if entry_id is ambiguous across stores.
 
     Returns:
         Confirmation with updated event details, or an error.
     """
-    def _update(outlook, namespace, entry_id, subject, start, end, location, body, account):
+    def _update(outlook, namespace, entry_id, subject, start, end, location, body,
+                categories, account):
         if account:
             store = _require_store(namespace, account)
             item = namespace.GetItemFromID(entry_id, store.StoreID)
@@ -1425,6 +1518,8 @@ async def update_event(
             item.Location = location
         if body:
             item.Body = body
+        if categories:
+            item.Categories = _join_categories(_split_categories(categories))
         item.Save()
         return json.dumps({
             "status": "updated",
@@ -1432,12 +1527,14 @@ async def update_event(
             "start": str(item.Start),
             "end": str(item.End),
             "location": item.Location or "",
+            "categories": item.Categories or "",
             "entry_id": item.EntryID,
         }, indent=2, default=str)
 
     try:
         return await bridge.call(
-            _update, entry_id, subject, start, end, location, body, account,
+            _update, entry_id, subject, start, end, location, body,
+            categories, account,
         )
     except Exception as e:
         return f"Error updating event: {format_com_error(e)}"
@@ -1555,6 +1652,7 @@ async def search_events(
     start_date: str = "",
     end_date: str = "",
     count: int = 10,
+    categories: str = "",
     account: str = "",
 ) -> str:
     """Search for calendar events by keyword.
@@ -1569,14 +1667,19 @@ async def search_events(
             days ago.
         end_date: End of search range. Default: 30 days from now.
         count: Maximum results to return. Default 10.
+        categories: Optional. Comma- or semicolon-separated color-category names. A match
+            must also carry AT LEAST ONE of them (case-insensitive). Pass an
+            empty query to filter by category alone. Default: no filter.
         account: Optional. Account display name (or substring) to target.
             Default: primary account. Use list_accounts to see available accounts.
 
     Returns:
         JSON array of matching event summaries.
     """
-    def _search(outlook, namespace, query, start_date, end_date, count, account):
+    def _search(outlook, namespace, query, start_date, end_date, count,
+                categories, account):
         count = min(max(1, count), 200)
+        wanted = _split_categories(categories)
         store = _require_store(namespace, account)
         calendar = store.GetDefaultFolder(OL_FOLDER_CALENDAR)
         items = calendar.Items
@@ -1597,16 +1700,21 @@ async def search_events(
         for item in filtered:
             if query_lower in (item.Subject or "").lower():
                 try:
-                    results.append(format_event_summary(item))
+                    summary = format_event_summary(item)
                 except Exception:
                     continue
+                if not _matches_any_category(summary["categories"], wanted):
+                    continue
+                results.append(summary)
                 if len(results) >= count:
                     break
 
         return json.dumps(results, indent=2, default=str)
 
     try:
-        return await bridge.call(_search, query, start_date, end_date, count, account)
+        return await bridge.call(
+            _search, query, start_date, end_date, count, categories, account,
+        )
     except Exception as e:
         return f"Error searching events: {format_com_error(e)}"
 
@@ -1924,24 +2032,34 @@ async def save_attachment(
 
 @mcp.tool()
 async def list_categories(account: str = "") -> str:
-    """List all available Outlook categories.
+    """List all available Outlook categories (the master list).
 
-    Returns the color categories configured in the user's Outlook profile.
-    These can be applied to emails, events, tasks, and other items.
+    Returns the color categories configured in the user's Outlook profile --
+    the "Categorize -> All Categories" dialog. These can be applied to emails,
+    events, tasks, and other items.
+
+    Note that an ITEM stores only the category NAME as text; this list supplies
+    the color and the picker. A name missing from here can still sit on an item
+    (shown without a color).
 
     Args:
-        account: Optional. Account display name (or substring) to target.
-            Default: primary account. Use list_accounts to see available accounts.
+        account: Optional. Accepted for consistency but NOT honored: the OOM
+            exposes only the default store's list, and per-store category
+            lists are not reachable through it.
 
     Returns:
-        JSON array of category objects with name and color index.
+        JSON array of objects with name, color (index) and color_name.
     """
     def _list(outlook, namespace, account):
-        # Categories are profile-wide, not per-store, but we accept the param for consistency
+        # Categories are profile-wide, not per-store -- see the account note.
         results = []
         for i in range(namespace.Categories.Count):
             cat = namespace.Categories.Item(i + 1)
-            results.append({"name": cat.Name, "color": cat.Color})
+            results.append({
+                "name": cat.Name,
+                "color": cat.Color,
+                "color_name": CATEGORY_COLOR_NAMES.get(cat.Color, "unknown"),
+            })
         return json.dumps(results, indent=2, default=str)
 
     try:
@@ -1954,41 +2072,241 @@ async def list_categories(account: str = "") -> str:
 async def set_category(
     entry_id: str,
     categories: str,
+    mode: str = "replace",
     account: str = "",
 ) -> str:
-    """Set categories on an email, event, or task.
+    """Set, add, or remove categories on an email, event, or task.
 
-    Replaces any existing categories on the item. Use comma-separated
-    values for multiple categories.
+    Outlook keeps categories as ONE string per item, joined with the system's
+    list separator (";" on a German Windows, "," on an English one), so adding
+    one normally means read-modify-write. The mode parameter does that here
+    instead of at the call site.
 
     Args:
         entry_id: The EntryID of the item to categorize.
-        categories: Category name(s), comma-separated. Example:
-            "Important" or "Work, Follow-up". Use an empty string to
-            clear all categories.
+        categories: Category name(s), separated by comma or semicolon -- both
+            are accepted whatever the locale writes. Example:
+            "Important" or "Work, Follow-up". With mode="replace", an empty
+            string clears all categories.
+        mode: "replace" (default) overwrites whatever the item carries;
+            "add" keeps the existing ones and appends what is missing;
+            "remove" subtracts the named ones and leaves the rest. Matching
+            for add/remove is case-insensitive; the spelling and order
+            already on the item are preserved.
         account: Optional. Account display name (or substring). Only needed
             if entry_id is ambiguous across stores.
 
     Returns:
-        Confirmation with the item subject and applied categories.
+        Confirmation with the item subject and the resulting categories.
     """
-    def _set(outlook, namespace, entry_id, categories, account):
+    # Validate BEFORE the bridge: exceptions raised inside the COM closure
+    # come back as a generic "An unexpected error occurred." (format_com_error
+    # only spells out com_error), so a typo in mode would be unreadable.
+    mode_key = (mode or "replace").strip().lower()
+    if mode_key not in ("replace", "add", "remove"):
+        return f"Error: invalid mode '{mode}'. Valid: replace, add, remove."
+
+    def _set(outlook, namespace, entry_id, categories, mode_key, account):
         if account:
             store = _require_store(namespace, account)
             item = namespace.GetItemFromID(entry_id, store.StoreID)
         else:
             item = namespace.GetItemFromID(entry_id)
-        item.Categories = categories
+
+        incoming = _split_categories(categories)
+        if mode_key == "replace":
+            final = incoming
+        elif mode_key == "add":
+            existing = _split_categories(item.Categories)
+            have = {c.lower() for c in existing}
+            final = existing + [
+                c for c in incoming if c.lower() not in have
+            ]
+        else:  # "remove"
+            drop = {c.lower() for c in incoming}
+            final = [
+                c for c in _split_categories(item.Categories)
+                if c.lower() not in drop
+            ]
+
+        # Emit the system's own separator, so a round-trip does not reformat
+        # the field -- see _category_separator.
+        item.Categories = _join_categories(final)
         item.Save()
         return (
-            f"Categories set on '{item.Subject}': "
+            f"Categories set on '{item.Subject}' (mode={mode_key}): "
             f"'{item.Categories or '(none)'}'"
         )
 
     try:
-        return await bridge.call(_set, entry_id, categories, account)
+        return await bridge.call(_set, entry_id, categories, mode_key, account)
     except Exception as e:
         return f"Error setting categories: {format_com_error(e)}"
+
+
+# ---------------------------------------------------------------------
+# Master-list management.
+#
+# The master list and the items are DECOUPLED: an item stores the category
+# name as plain text, the list only supplies colour and picker. Measured
+# 2026-09-14 against Outlook, with a probe category on a probe appointment:
+#
+#   rename in the list  -> item still reads the OLD name (not retagged)
+#   delete from list    -> item still reads the name (kept, just colourless)
+#   Categories.Remove() -> accepts the NAME (index fallback kept, cheap)
+#   duplicate Add()     -> raises ArgumentException, so pre-check instead
+#
+# Nothing here touches items, by design: retagging would mean scanning every
+# folder, which is a different tool with a different risk profile.
+# ---------------------------------------------------------------------
+
+def _find_category(namespace, name: str):
+    """Return (index, category) for a case-insensitive name match, else (None, None)."""
+    wanted = (name or "").strip().lower()
+    for i in range(1, namespace.Categories.Count + 1):
+        cat = namespace.Categories.Item(i)
+        if (cat.Name or "").strip().lower() == wanted:
+            return i, cat
+    return None, None
+
+
+@mcp.tool()
+async def create_category(name: str, color: str = "", account: str = "") -> str:
+    """Add a color category to the Outlook master list.
+
+    Args:
+        name: The category name. Must not already exist (case-insensitive);
+            an existing name is reported, not duplicated.
+        color: Optional. Friendly color name -- "red", "orange", "peach",
+            "yellow", "green", "teal", "olive", "blue", "purple", "maroon",
+            "steel", "gray", "black" and their "dark_" variants, or "none".
+            Omit to let Outlook pick the next free color.
+        account: Optional. Accepted for consistency but NOT honored -- see
+            list_categories.
+
+    Returns:
+        Confirmation with the name and resulting color, or an error.
+    """
+    name = (name or "").strip()
+    if not name:
+        return "Error: name must not be empty."
+
+    color_index = None
+    if color:
+        key = color.strip().lower().replace(" ", "_").replace("-", "_")
+        if key not in CATEGORY_COLOR_FROM_NAME:
+            valid = ", ".join(sorted(CATEGORY_COLOR_FROM_NAME))
+            return f"Error: invalid color '{color}'. Valid: {valid}."
+        color_index = CATEGORY_COLOR_FROM_NAME[key]
+
+    def _create(outlook, namespace, name, color_index, account):
+        # Add() raises ArgumentException on a duplicate, so check first and
+        # answer idempotently instead of surfacing a COM error.
+        idx, existing = _find_category(namespace, name)
+        if existing is not None:
+            return (
+                f"Category '{existing.Name}' already exists "
+                f"(color {CATEGORY_COLOR_NAMES.get(existing.Color, 'unknown')}); nothing changed."
+            )
+        if color_index is None:
+            namespace.Categories.Add(name)
+        else:
+            namespace.Categories.Add(name, color_index)
+        _, created = _find_category(namespace, name)
+        shade = CATEGORY_COLOR_NAMES.get(created.Color, "unknown") if created else "unknown"
+        return f"Category created: '{name}' (color {shade})"
+
+    try:
+        return await bridge.call(_create, name, color_index, account)
+    except Exception as e:
+        return f"Error creating category: {format_com_error(e)}"
+
+
+@mcp.tool()
+async def rename_category(name: str, new_name: str, account: str = "") -> str:
+    """Rename a category in the master list.
+
+    WARNING -- this renames the LIST ENTRY ONLY. Items already carrying the
+    old name keep it verbatim (measured: they do not follow the rename) and
+    end up pointing at a name that no longer exists, i.e. shown without a
+    color. To move items across, set_category them before or after.
+
+    Args:
+        name: Current category name (case-insensitive match).
+        new_name: New name. Must not collide with another existing category.
+        account: Optional. Accepted for consistency but NOT honored.
+
+    Returns:
+        Confirmation, plus the reminder about existing items.
+    """
+    name = (name or "").strip()
+    new_name = (new_name or "").strip()
+    if not name or not new_name:
+        return "Error: both name and new_name must be non-empty."
+
+    def _rename(outlook, namespace, name, new_name, account):
+        idx, cat = _find_category(namespace, name)
+        if cat is None:
+            return f"Error: no category named '{name}'."
+        if (cat.Name or "").strip().lower() != new_name.lower():
+            clash_idx, clash = _find_category(namespace, new_name)
+            if clash is not None:
+                return f"Error: a category named '{clash.Name}' already exists."
+        old = cat.Name
+        cat.Name = new_name
+        return (
+            f"Category renamed: '{old}' -> '{new_name}'. "
+            f"Items already tagged '{old}' keep that text and are NOT retagged."
+        )
+
+    try:
+        return await bridge.call(_rename, name, new_name, account)
+    except Exception as e:
+        return f"Error renaming category: {format_com_error(e)}"
+
+
+@mcp.tool()
+async def delete_category(name: str, account: str = "") -> str:
+    """Remove a category from the master list.
+
+    WARNING -- this removes the LIST ENTRY ONLY. Items already carrying the
+    name keep it verbatim (measured), they merely lose the color. Clearing it
+    off items is set_category(..., mode="remove"), item by item.
+
+    Args:
+        name: Category name to remove (case-insensitive match).
+        account: Optional. Accepted for consistency but NOT honored.
+
+    Returns:
+        Confirmation, or an error if no such category exists.
+    """
+    name = (name or "").strip()
+    if not name:
+        return "Error: name must not be empty."
+
+    def _delete(outlook, namespace, name, account):
+        idx, cat = _find_category(namespace, name)
+        if cat is None:
+            return f"Error: no category named '{name}'."
+        actual = cat.Name
+        # Remove() takes the name on this build; fall back to the 1-based
+        # index if a future/other build disagrees.
+        try:
+            namespace.Categories.Remove(actual)
+        except Exception:
+            namespace.Categories.Remove(idx)
+        still, _ = _find_category(namespace, actual)
+        if still is not None:
+            return f"Error: '{actual}' is still in the list after Remove()."
+        return (
+            f"Category deleted: '{actual}'. Items already tagged with it keep "
+            f"the name (now without a color)."
+        )
+
+    try:
+        return await bridge.call(_delete, name, account)
+    except Exception as e:
+        return f"Error deleting category: {format_com_error(e)}"
 
 
 # =====================================================================

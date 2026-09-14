@@ -111,3 +111,21 @@ FLAG_STATUS_NAMES = {0: "none", 1: "complete", 2: "flagged"}
 OL_RULE_ACTION_MOVE = 1
 OL_RULE_ACTION_DELETE = 8
 OL_RULE_ACTION_MARK_READ = 11
+
+
+# OlCategoryColor, read off the typelib (win32com constants, olCategoryColor*)
+# rather than guessed -- 0 = none, 1..25 = the palette the Outlook dialog shows.
+# Index -> friendly name, for reporting.
+CATEGORY_COLOR_NAMES = {
+    0: "none", 1: "red", 2: "orange", 3: "peach", 4: "yellow",
+    5: "green", 6: "teal", 7: "olive", 8: "blue", 9: "purple",
+    10: "maroon", 11: "steel", 12: "dark_steel", 13: "gray",
+    14: "dark_gray", 15: "black", 16: "dark_red", 17: "dark_orange",
+    18: "dark_peach", 19: "dark_yellow", 20: "dark_green",
+    21: "dark_teal", 22: "dark_olive", 23: "dark_blue",
+    24: "dark_purple", 25: "dark_maroon",
+}
+
+# Reverse map for WRITING a colour from a friendly name. Keys are normalized:
+# lower-cased, spaces/hyphens -> underscores, as with BUSY_STATUS_FROM_NAME.
+CATEGORY_COLOR_FROM_NAME = {v: k for k, v in CATEGORY_COLOR_NAMES.items()}
