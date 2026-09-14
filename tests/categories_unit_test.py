@@ -52,22 +52,77 @@ class FakeNamespace:
         return self._item
 
 
+class FakeCategory:
+    def __init__(self, name, color=0):
+        self.Name = name
+        self.Color = color
+
+
+class FakeCategories:
+    """Stand-in for namespace.Categories, 1-BASED like the COM collection.
+
+    Mirrors the two behaviours measured against Outlook on 2026-09-14:
+    Add() raises on a duplicate name, Remove() accepts the name.
+    """
+
+    def __init__(self, names=()):
+        self._items = [FakeCategory(n, i + 1) for i, n in enumerate(names)]
+
+    @property
+    def Count(self):
+        return len(self._items)
+
+    def Item(self, index):
+        return self._items[index - 1]
+
+    def Add(self, name, color=None):
+        if any(c.Name.lower() == name.lower() for c in self._items):
+            raise ValueError("Value does not fall within the expected range.")
+        self._items.append(FakeCategory(name, 7 if color is None else color))
+
+    def Remove(self, index):
+        if isinstance(index, str):
+            for i, c in enumerate(self._items):
+                if c.Name == index:
+                    del self._items[i]
+                    return
+            raise ValueError("no such category")
+        del self._items[index - 1]
+
+    def names(self):
+        return [c.Name for c in self._items]
+
+
+class FakeCatNamespace:
+    def __init__(self, categories):
+        self.Categories = categories
+
+
+def _run_with_namespace(name, args, namespace):
+    original = server.bridge.call
+
+    async def fake_call(func, *a, **kw):
+        return func(None, namespace, *a, **kw)
+
+    server.bridge.call = fake_call
+    try:
+        return str(asyncio.run(mcp.call_tool(name, args)))
+    finally:
+        server.bridge.call = original
+
+
 def call_tool(name, args, item):
     """Invoke a registered MCP tool with the COM bridge stubbed out.
 
     Runs the tool's inner closure against FakeNamespace instead of a real
     Outlook, so the production code path -- not a copy of it -- is measured.
     """
-    original = server.bridge.call
+    return _run_with_namespace(name, args, FakeNamespace(item))
 
-    async def fake_call(func, *a, **kw):
-        return func(None, FakeNamespace(item), *a, **kw)
 
-    server.bridge.call = fake_call
-    try:
-        return asyncio.run(mcp.call_tool(name, args))
-    finally:
-        server.bridge.call = original
+def call_cat_tool(name, args, cats):
+    """Same, for the master-list tools, which talk to namespace.Categories."""
+    return _run_with_namespace(name, args, FakeCatNamespace(cats))
 
 
 # --- helpers ---
@@ -286,6 +341,93 @@ def test_full_does_not_duplicate_categories():
     log("  full view inherits the field instead of setting it twice")
 
 
+# --- master list ---
+
+def test_create_category_adds_with_named_color():
+    cats = FakeCategories(["Internal"])
+    out = call_cat_tool("create_category", {"name": "Reise", "color": "blue"}, cats)
+    assert cats.names() == ["Internal", "Reise"], cats.names()
+    assert cats.Item(2).Color == 8, cats.Item(2).Color  # olCategoryColorBlue
+    assert "blue" in out, out
+    log(f"  added 'Reise' as color 8; list now {cats.names()}")
+
+
+def test_create_category_is_idempotent_not_an_error():
+    """Add() raises on a duplicate -- pre-check, and answer without a COM error."""
+    cats = FakeCategories(["Internal"])
+    out = call_cat_tool("create_category", {"name": "internal"}, cats)
+    assert cats.names() == ["Internal"], cats.names()
+    assert "already exists" in out, out
+    assert "unexpected error" not in out.lower(), out
+    log("  duplicate (different case) reported, not raised, not duplicated")
+
+
+def test_create_category_rejects_an_unknown_color():
+    cats = FakeCategories([])
+    out = call_cat_tool("create_category", {"name": "X", "color": "chartreuse"}, cats)
+    assert cats.names() == [], cats.names()
+    assert "chartreuse" in out and "dark_maroon" in out, out
+    log("  invalid color names the valid set and adds nothing")
+
+
+def test_rename_category_renames_only_the_list_entry():
+    """Measured: items keep the old text, so the answer has to say so."""
+    cats = FakeCategories(["Internal", "Reise"])
+    out = call_cat_tool(
+        "rename_category", {"name": "internal", "new_name": "Intern"}, cats
+    )
+    assert cats.names() == ["Intern", "Reise"], cats.names()
+    assert "NOT retagged" in out, out
+    log(f"  renamed in place -> {cats.names()}, warning present")
+
+
+def test_rename_category_refuses_a_collision():
+    cats = FakeCategories(["Internal", "Reise"])
+    out = call_cat_tool(
+        "rename_category", {"name": "Internal", "new_name": "reise"}, cats
+    )
+    assert cats.names() == ["Internal", "Reise"], cats.names()
+    assert "already exists" in out, out
+    log("  collision refused, list untouched")
+
+
+def test_rename_category_reports_a_missing_name():
+    cats = FakeCategories(["Internal"])
+    out = call_cat_tool("rename_category", {"name": "Nope", "new_name": "X"}, cats)
+    assert "no category named" in out, out
+    assert cats.names() == ["Internal"]
+    log("  missing source name reported plainly")
+
+
+def test_delete_category_removes_by_name():
+    cats = FakeCategories(["Internal", "Reise", "SMA"])
+    out = call_cat_tool("delete_category", {"name": "reise"}, cats)
+    assert cats.names() == ["Internal", "SMA"], cats.names()
+    assert "keep the name" in out, out
+    log(f"  deleted -> {cats.names()}, item-side consequence stated")
+
+
+def test_delete_category_reports_a_missing_name():
+    cats = FakeCategories(["Internal"])
+    out = call_cat_tool("delete_category", {"name": "Nope"}, cats)
+    assert "no category named" in out, out
+    assert cats.names() == ["Internal"]
+    log("  deleting something absent changes nothing")
+
+
+def test_color_map_is_contiguous_and_reversible():
+    """Guard for the typelib-derived palette: 0..25, no duplicate names."""
+    from outlook_desktop_mcp.tools._folder_constants import (
+        CATEGORY_COLOR_FROM_NAME,
+        CATEGORY_COLOR_NAMES,
+    )
+    assert sorted(CATEGORY_COLOR_NAMES) == list(range(26)), "gaps in the enum"
+    assert len(CATEGORY_COLOR_FROM_NAME) == 26, "duplicate color names"
+    assert CATEGORY_COLOR_FROM_NAME["blue"] == 8
+    assert CATEGORY_COLOR_NAMES[25] == "dark_maroon"
+    log("  26 colors, 0..25 contiguous, name<->index reversible")
+
+
 def main():
     tests = [
         ("Split trims and drops empties", test_split_trims_and_drops_empties),
@@ -306,6 +448,15 @@ def main():
         ("Invalid mode fails loudly", test_invalid_mode_fails_loudly),
         ("Summary carries categories", test_summary_carries_categories),
         ("Full does not duplicate", test_full_does_not_duplicate_categories),
+        ("Create adds with named color", test_create_category_adds_with_named_color),
+        ("Create is idempotent", test_create_category_is_idempotent_not_an_error),
+        ("Create rejects unknown color", test_create_category_rejects_an_unknown_color),
+        ("Rename touches only the list", test_rename_category_renames_only_the_list_entry),
+        ("Rename refuses a collision", test_rename_category_refuses_a_collision),
+        ("Rename reports missing name", test_rename_category_reports_a_missing_name),
+        ("Delete removes by name", test_delete_category_removes_by_name),
+        ("Delete reports missing name", test_delete_category_reports_a_missing_name),
+        ("Color map contiguous/reversible", test_color_map_is_contiguous_and_reversible),
     ]
     failed = 0
     for name, fn in tests:

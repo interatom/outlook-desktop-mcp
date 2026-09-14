@@ -25,6 +25,8 @@ from outlook_desktop_mcp.tools._folder_constants import (
     FOLDER_NAME_TO_ENUM,
     BUSY_STATUS_FROM_NAME,
     BUSY_STATUS_NAMES,
+    CATEGORY_COLOR_FROM_NAME,
+    CATEGORY_COLOR_NAMES,
     OL_MAIL_ITEM,
     OL_APPOINTMENT_ITEM,
     OL_FOLDER_CALENDAR,
@@ -194,7 +196,8 @@ mcp = FastMCP(
         "- Calendar: list events, create appointments/meetings, update, delete, "
         "respond to invites, search events\n"
         "- Tasks: create, list, complete, update, delete to-do items\n"
-        "- Categories: list them, and set/add/remove them on any item\n"
+        "- Categories: set/add/remove them on any item, and manage the master\n"
+        "  list itself (list, create, rename, delete)\n"
         "- Rules: list and manage mail rules\n"
         "- Out of Office: check auto-reply status\n"
         "- Folders: list folder hierarchy with item counts"
@@ -2029,24 +2032,34 @@ async def save_attachment(
 
 @mcp.tool()
 async def list_categories(account: str = "") -> str:
-    """List all available Outlook categories.
+    """List all available Outlook categories (the master list).
 
-    Returns the color categories configured in the user's Outlook profile.
-    These can be applied to emails, events, tasks, and other items.
+    Returns the color categories configured in the user's Outlook profile --
+    the "Categorize -> All Categories" dialog. These can be applied to emails,
+    events, tasks, and other items.
+
+    Note that an ITEM stores only the category NAME as text; this list supplies
+    the color and the picker. A name missing from here can still sit on an item
+    (shown without a color).
 
     Args:
-        account: Optional. Account display name (or substring) to target.
-            Default: primary account. Use list_accounts to see available accounts.
+        account: Optional. Accepted for consistency but NOT honored: the OOM
+            exposes only the default store's list, and per-store category
+            lists are not reachable through it.
 
     Returns:
-        JSON array of category objects with name and color index.
+        JSON array of objects with name, color (index) and color_name.
     """
     def _list(outlook, namespace, account):
-        # Categories are profile-wide, not per-store, but we accept the param for consistency
+        # Categories are profile-wide, not per-store -- see the account note.
         results = []
         for i in range(namespace.Categories.Count):
             cat = namespace.Categories.Item(i + 1)
-            results.append({"name": cat.Name, "color": cat.Color})
+            results.append({
+                "name": cat.Name,
+                "color": cat.Color,
+                "color_name": CATEGORY_COLOR_NAMES.get(cat.Color, "unknown"),
+            })
         return json.dumps(results, indent=2, default=str)
 
     try:
@@ -2129,6 +2142,171 @@ async def set_category(
         return await bridge.call(_set, entry_id, categories, mode_key, account)
     except Exception as e:
         return f"Error setting categories: {format_com_error(e)}"
+
+
+# ---------------------------------------------------------------------
+# Master-list management.
+#
+# The master list and the items are DECOUPLED: an item stores the category
+# name as plain text, the list only supplies colour and picker. Measured
+# 2026-09-14 against Outlook, with a probe category on a probe appointment:
+#
+#   rename in the list  -> item still reads the OLD name (not retagged)
+#   delete from list    -> item still reads the name (kept, just colourless)
+#   Categories.Remove() -> accepts the NAME (index fallback kept, cheap)
+#   duplicate Add()     -> raises ArgumentException, so pre-check instead
+#
+# Nothing here touches items, by design: retagging would mean scanning every
+# folder, which is a different tool with a different risk profile.
+# ---------------------------------------------------------------------
+
+def _find_category(namespace, name: str):
+    """Return (index, category) for a case-insensitive name match, else (None, None)."""
+    wanted = (name or "").strip().lower()
+    for i in range(1, namespace.Categories.Count + 1):
+        cat = namespace.Categories.Item(i)
+        if (cat.Name or "").strip().lower() == wanted:
+            return i, cat
+    return None, None
+
+
+@mcp.tool()
+async def create_category(name: str, color: str = "", account: str = "") -> str:
+    """Add a color category to the Outlook master list.
+
+    Args:
+        name: The category name. Must not already exist (case-insensitive);
+            an existing name is reported, not duplicated.
+        color: Optional. Friendly color name -- "red", "orange", "peach",
+            "yellow", "green", "teal", "olive", "blue", "purple", "maroon",
+            "steel", "gray", "black" and their "dark_" variants, or "none".
+            Omit to let Outlook pick the next free color.
+        account: Optional. Accepted for consistency but NOT honored -- see
+            list_categories.
+
+    Returns:
+        Confirmation with the name and resulting color, or an error.
+    """
+    name = (name or "").strip()
+    if not name:
+        return "Error: name must not be empty."
+
+    color_index = None
+    if color:
+        key = color.strip().lower().replace(" ", "_").replace("-", "_")
+        if key not in CATEGORY_COLOR_FROM_NAME:
+            valid = ", ".join(sorted(CATEGORY_COLOR_FROM_NAME))
+            return f"Error: invalid color '{color}'. Valid: {valid}."
+        color_index = CATEGORY_COLOR_FROM_NAME[key]
+
+    def _create(outlook, namespace, name, color_index, account):
+        # Add() raises ArgumentException on a duplicate, so check first and
+        # answer idempotently instead of surfacing a COM error.
+        idx, existing = _find_category(namespace, name)
+        if existing is not None:
+            return (
+                f"Category '{existing.Name}' already exists "
+                f"(color {CATEGORY_COLOR_NAMES.get(existing.Color, 'unknown')}); nothing changed."
+            )
+        if color_index is None:
+            namespace.Categories.Add(name)
+        else:
+            namespace.Categories.Add(name, color_index)
+        _, created = _find_category(namespace, name)
+        shade = CATEGORY_COLOR_NAMES.get(created.Color, "unknown") if created else "unknown"
+        return f"Category created: '{name}' (color {shade})"
+
+    try:
+        return await bridge.call(_create, name, color_index, account)
+    except Exception as e:
+        return f"Error creating category: {format_com_error(e)}"
+
+
+@mcp.tool()
+async def rename_category(name: str, new_name: str, account: str = "") -> str:
+    """Rename a category in the master list.
+
+    WARNING -- this renames the LIST ENTRY ONLY. Items already carrying the
+    old name keep it verbatim (measured: they do not follow the rename) and
+    end up pointing at a name that no longer exists, i.e. shown without a
+    color. To move items across, set_category them before or after.
+
+    Args:
+        name: Current category name (case-insensitive match).
+        new_name: New name. Must not collide with another existing category.
+        account: Optional. Accepted for consistency but NOT honored.
+
+    Returns:
+        Confirmation, plus the reminder about existing items.
+    """
+    name = (name or "").strip()
+    new_name = (new_name or "").strip()
+    if not name or not new_name:
+        return "Error: both name and new_name must be non-empty."
+
+    def _rename(outlook, namespace, name, new_name, account):
+        idx, cat = _find_category(namespace, name)
+        if cat is None:
+            return f"Error: no category named '{name}'."
+        if (cat.Name or "").strip().lower() != new_name.lower():
+            clash_idx, clash = _find_category(namespace, new_name)
+            if clash is not None:
+                return f"Error: a category named '{clash.Name}' already exists."
+        old = cat.Name
+        cat.Name = new_name
+        return (
+            f"Category renamed: '{old}' -> '{new_name}'. "
+            f"Items already tagged '{old}' keep that text and are NOT retagged."
+        )
+
+    try:
+        return await bridge.call(_rename, name, new_name, account)
+    except Exception as e:
+        return f"Error renaming category: {format_com_error(e)}"
+
+
+@mcp.tool()
+async def delete_category(name: str, account: str = "") -> str:
+    """Remove a category from the master list.
+
+    WARNING -- this removes the LIST ENTRY ONLY. Items already carrying the
+    name keep it verbatim (measured), they merely lose the color. Clearing it
+    off items is set_category(..., mode="remove"), item by item.
+
+    Args:
+        name: Category name to remove (case-insensitive match).
+        account: Optional. Accepted for consistency but NOT honored.
+
+    Returns:
+        Confirmation, or an error if no such category exists.
+    """
+    name = (name or "").strip()
+    if not name:
+        return "Error: name must not be empty."
+
+    def _delete(outlook, namespace, name, account):
+        idx, cat = _find_category(namespace, name)
+        if cat is None:
+            return f"Error: no category named '{name}'."
+        actual = cat.Name
+        # Remove() takes the name on this build; fall back to the 1-based
+        # index if a future/other build disagrees.
+        try:
+            namespace.Categories.Remove(actual)
+        except Exception:
+            namespace.Categories.Remove(idx)
+        still, _ = _find_category(namespace, actual)
+        if still is not None:
+            return f"Error: '{actual}' is still in the list after Remove()."
+        return (
+            f"Category deleted: '{actual}'. Items already tagged with it keep "
+            f"the name (now without a color)."
+        )
+
+    try:
+        return await bridge.call(_delete, name, account)
+    except Exception as e:
+        return f"Error deleting category: {format_com_error(e)}"
 
 
 # =====================================================================
