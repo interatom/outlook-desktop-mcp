@@ -46,6 +46,8 @@ from outlook_desktop_mcp.tools._folder_constants import (
     OL_FLAG_MARKED,
 )
 from outlook_desktop_mcp.utils.formatting import (
+    DRAFT_SUMMARY_FIELDS,
+    format_draft_summary,
     format_email_summary,
     format_email_full,
     format_event_summary,
@@ -74,20 +76,24 @@ logger = logging.getLogger("outlook_desktop_mcp")
 
 # --- Response helpers ---
 
-def _summary_envelope(results, total):
-    """Wrap email summaries with completeness metadata.
+def _summary_envelope(results, total, *, key="emails", cursor_field="received_time"):
+    """Wrap item summaries with completeness metadata.
 
     A clamped or count-limited listing is otherwise indistinguishable from a
     complete one: the caller sees N items and nothing else. "truncated" plus
     "oldest_returned" make the cut-off visible and give the caller the exact
     cursor to page backwards with (pass it as end_date).
+
+    `key` and `cursor_field` exist for listings whose items are not received
+    mail — the Drafts listing keys on "drafts" and pages by last_modified,
+    because an unsent item has no ReceivedTime.
     """
     return {
-        "emails": results,
+        key: results,
         "returned": len(results),
         "total_matching": total,
         "truncated": total > len(results),
-        "oldest_returned": results[-1].get("received_time", "") if results else "",
+        "oldest_returned": results[-1].get(cursor_field, "") if results else "",
     }
 
 
@@ -427,6 +433,276 @@ async def send_email(
         return await bridge.call(_send, to, subject, body, cc, bcc, html_body, account)
     except Exception as e:
         return f"Error sending email: {format_com_error(e)}"
+
+
+# =====================================================================
+# TOOL 1B: save_draft
+# =====================================================================
+
+@mcp.tool()
+async def save_draft(
+    to: str,
+    subject: str,
+    body: str,
+    cc: str = "",
+    bcc: str = "",
+    html_body: str = "",
+    account: str = "",
+) -> str:
+    """Save an email as a draft in Outlook's Drafts folder without sending.
+
+    Creates an email and stores it in the Drafts folder of the selected account
+    so the user can review, edit, and send it later from Outlook. The message
+    is NOT sent — use send_email for that. This is the recommended tool when a
+    workflow requires human review before delivery.
+
+    Args:
+        to: One or more recipient email addresses, separated by semicolons.
+            Example: "alice@example.com" or "alice@example.com; bob@example.com"
+        subject: The email subject line.
+        body: The plain-text body of the email. If html_body is also provided,
+            both are set and Outlook will prefer the HTML version.
+        cc: Optional. CC recipients, separated by semicolons.
+        bcc: Optional. BCC recipients, separated by semicolons.
+        html_body: Optional. HTML-formatted body. When provided, Outlook renders
+            the email as HTML. The plain-text body serves as fallback.
+        account: Optional. Account display name (or substring) to save under.
+            Default: primary account. Use list_accounts to see available accounts.
+
+    Returns:
+        A confirmation message with subject and recipients, or an error.
+    """
+    def _save(outlook, namespace, to, subject, body, cc, bcc, html_body, account):
+        store = _require_store(namespace, account)
+        mail = outlook.CreateItem(OL_MAIL_ITEM)
+        # Set the sending account so the draft is filed under the correct Drafts folder
+        for acc in outlook.Session.Accounts:
+            if acc.DeliveryStore.StoreID == store.StoreID:
+                mail._oleobj_.Invoke(*(64209, 0, 8, 0, acc))  # SendUsingAccount
+                break
+        mail.To = to
+        mail.Subject = subject
+        mail.Body = body
+        if cc:
+            mail.CC = cc
+        if bcc:
+            mail.BCC = bcc
+        if html_body:
+            mail.HTMLBody = html_body
+        mail.Save()
+        return f"Draft saved: '{subject}' to {to}"
+
+    try:
+        return await bridge.call(_save, to, subject, body, cc, bcc, html_body, account)
+    except Exception as e:
+        return f"Error saving draft: {format_com_error(e)}"
+
+
+# =====================================================================
+# TOOL 1C: list_drafts
+# =====================================================================
+
+@mcp.tool()
+async def list_drafts(
+    limit: int = 50,
+    offset: int = 0,
+    account: str = "",
+    fields: str = "",
+) -> str:
+    """List drafts currently saved in Outlook's Drafts folder.
+
+    Returns the same envelope shape as list_emails, keyed on "drafts", sorted
+    by last-modified time (newest first). Use entry_id with read_draft to load
+    the full body, or with send_draft to dispatch the message.
+
+    Args:
+        limit: Maximum number of drafts to return. Default 50, capped at 200.
+        offset: Number of newest drafts to skip before returning results.
+            Useful for pagination. Default 0.
+        account: Optional. Account display name (or substring) to target.
+            Default: primary account. Use list_accounts to see available accounts.
+        fields: Optional comma-separated subset of summary fields, as in
+            list_emails. Default: all fields. Omitted fields are never read
+            from Outlook, which matters most for body_preview — it pulls the
+            whole body across COM to keep 200 characters. An unknown name is
+            rejected rather than silently dropped. Valid: entry_id, subject,
+            to, cc, bcc, last_modified, has_attachments, attachment_count,
+            body_preview.
+
+    Returns:
+        JSON object with:
+          drafts          - array of draft summary objects
+          returned        - number of summaries in "drafts"
+          total_matching  - how many drafts the folder holds
+          truncated       - True when the folder holds more than was returned
+          oldest_returned - last_modified of the last summary, the paging cursor
+    """
+    def _list(outlook, namespace, limit, offset, account, fields):
+        limit = min(max(1, limit), 200)
+        offset = max(0, offset)
+        selected, field_error = parse_summary_fields(fields, DRAFT_SUMMARY_FIELDS)
+        if field_error:
+            return json.dumps({"error": field_error})
+        store = _require_store(namespace, account)
+        drafts = store.GetDefaultFolder(16)  # olFolderDrafts
+
+        items = drafts.Items
+        # Drafts use LastModificationTime rather than ReceivedTime
+        try:
+            items.Sort("[LastModificationTime]", True)
+        except Exception:
+            # Fallback: some stores reject sort on Drafts; iterate as-is
+            pass
+
+        total = items.Count
+        results = []
+        # Iterate sorted items, honoring offset and limit
+        # items.Item is 1-indexed
+        start = offset + 1
+        end = min(offset + limit, total)
+        for i in range(start, end + 1):
+            try:
+                results.append(format_draft_summary(items.Item(i), selected))
+            except Exception:
+                continue
+        return json.dumps(
+            _summary_envelope(results, total, key="drafts", cursor_field="last_modified"),
+            indent=2,
+            default=str,
+        )
+
+    try:
+        return await bridge.call(_list, limit, offset, account, fields)
+    except Exception as e:
+        return f"Error listing drafts: {format_com_error(e)}"
+
+
+# =====================================================================
+# TOOL 1D: read_draft
+# =====================================================================
+
+@mcp.tool()
+async def read_draft(
+    draft_id: str,
+    account: str = "",
+) -> str:
+    """Read the full content of a specific draft.
+
+    Retrieves complete draft details including the full body, all recipients
+    (To/CC/BCC), attachment file names, and last-modified time. Use this to
+    review a draft before calling send_draft.
+
+    Args:
+        draft_id: The unique Outlook EntryID of the draft. Get this from
+            list_drafts results.
+        account: Optional. Account display name (or substring). Only needed
+            if draft_id is ambiguous across stores.
+
+    Returns:
+        JSON object with full draft details (entry_id, subject, to, cc, bcc,
+        body, html_body, attachments, last_modified, has_attachments).
+    """
+    def _read(outlook, namespace, draft_id, account):
+        if account:
+            store = _require_store(namespace, account)
+            item = namespace.GetItemFromID(draft_id, store.StoreID)
+        else:
+            item = namespace.GetItemFromID(draft_id)
+        if err := _check_item_class(item, _OL_CLASS_MAIL, "mail item"):
+            return err
+
+        attachments = []
+        try:
+            for i in range(item.Attachments.Count):
+                try:
+                    attachments.append(item.Attachments.Item(i + 1).FileName)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # HTMLBody may be very large; expose it but truncated like Body
+        html_body = ""
+        try:
+            html_body = item.HTMLBody or ""
+        except Exception:
+            html_body = ""
+
+        result = {
+            "entry_id": item.EntryID,
+            "subject": item.Subject or "(no subject)",
+            "to": item.To or "",
+            "cc": item.CC or "",
+            "bcc": item.BCC or "",
+            "body": item.Body or "",
+            "html_body": html_body,
+            "attachments": attachments,
+            "has_attachments": len(attachments) > 0,
+            "attachment_count": len(attachments),
+            "last_modified": str(item.LastModificationTime),
+        }
+        return json.dumps(result, indent=2, default=str)
+
+    try:
+        return await bridge.call(_read, draft_id, account)
+    except Exception as e:
+        return f"Error reading draft: {format_com_error(e)}"
+
+
+# =====================================================================
+# TOOL 1E: send_draft
+# =====================================================================
+
+@mcp.tool()
+async def send_draft(
+    draft_id: str,
+    account: str = "",
+) -> str:
+    """Send an existing draft from Outlook's Drafts folder.
+
+    Looks up the draft by EntryID and calls MailItem.Send() on it. After a
+    successful send, Outlook automatically moves the message from Drafts to
+    Sent Items (this is standard Outlook behavior, not something this tool
+    does explicitly). The EntryID of the message changes when it moves
+    folders, so the returned message_id reflects the post-send location when
+    available.
+
+    Args:
+        draft_id: The unique Outlook EntryID of the draft to send. Get this
+            from list_drafts results.
+        account: Optional. Account display name (or substring). Only needed
+            if draft_id is ambiguous across stores.
+
+    Returns:
+        Confirmation message including the sent subject and recipients, or
+        an error.
+    """
+    def _send(outlook, namespace, draft_id, account):
+        if account:
+            store = _require_store(namespace, account)
+            item = namespace.GetItemFromID(draft_id, store.StoreID)
+        else:
+            item = namespace.GetItemFromID(draft_id)
+        if err := _check_item_class(item, _OL_CLASS_MAIL, "mail item"):
+            return err
+
+        subject = item.Subject or "(no subject)"
+        to = item.To or ""
+        # Send() triggers Outlook to deliver the message and (in standard
+        # Outlook behavior) move it to the Sent Items folder. The original
+        # EntryID is no longer valid afterward — Outlook assigns a new one.
+        item.Send()
+        return json.dumps({
+            "status": "sent",
+            "subject": subject,
+            "to": to,
+            "message": f"Draft sent: '{subject}' to {to}",
+        }, indent=2, default=str)
+
+    try:
+        return await bridge.call(_send, draft_id, account)
+    except Exception as e:
+        return f"Error sending draft: {format_com_error(e)}"
 
 
 # =====================================================================
