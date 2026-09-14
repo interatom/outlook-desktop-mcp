@@ -124,6 +124,7 @@ def format_event_summary(item) -> dict:
         "meeting_status": MEETING_STATUS_NAMES.get(item.MeetingStatus, "unknown"),
         "required_attendees": item.RequiredAttendees or "",
         "optional_attendees": item.OptionalAttendees or "",
+        "categories": item.Categories or "",
     }
 
 
@@ -135,7 +136,6 @@ def format_event_full(item, body_max_length: int = 5000) -> dict:
     result["reminder_minutes"] = (
         item.ReminderMinutesBeforeStart if item.ReminderSet else None
     )
-    result["categories"] = item.Categories or ""
     result["response_status"] = RESPONSE_NAMES.get(item.ResponseStatus, "unknown")
     return result
 
