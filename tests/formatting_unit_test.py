@@ -229,10 +229,118 @@ def test_restrict_date_order_survives_ambiguity():
     log(f"  day stays in slot {day_slot}: {probe} -> {ambiguous}")
 
 
+class FakeDraft:
+    """Minimal draft MailItem stand-in that records which properties were read."""
+
+    def __init__(self, counter, body="Sehr geehrte Damen und Herren, " + "x" * 300):
+        self._counter = counter
+        self._body = body
+
+    def _hit(self, name):
+        self._counter.append(name)
+
+    @property
+    def EntryID(self):
+        self._hit("EntryID")
+        return "0000DEADBEEF"
+
+    @property
+    def Subject(self):
+        self._hit("Subject")
+        return "Angebot"
+
+    @property
+    def To(self):
+        self._hit("To")
+        return "alice@example.com"
+
+    @property
+    def CC(self):
+        self._hit("CC")
+        return ""
+
+    @property
+    def BCC(self):
+        self._hit("BCC")
+        return ""
+
+    @property
+    def LastModificationTime(self):
+        self._hit("LastModificationTime")
+        return "2026-09-14 09:15:00+00:00"
+
+    @property
+    def Attachments(self):
+        # Not FakeAttachments: that one counts into a dict, this fixture
+        # records read property NAMES so the lazy-read test can assert on them.
+        self._hit("Attachments")
+        counter = self._counter
+
+        class _Att:
+            @property
+            def Count(self):
+                counter.append("Attachments.Count")
+                return 0
+
+        return _Att()
+
+    @property
+    def Body(self):
+        self._hit("Body")
+        return self._body
+
+
+def test_draft_default_returns_all_fields():
+    from outlook_desktop_mcp.utils.formatting import DRAFT_SUMMARY_FIELDS, format_draft_summary
+    out = format_draft_summary(FakeDraft([]))
+    assert tuple(out.keys()) == DRAFT_SUMMARY_FIELDS, out
+    log(f"  {len(out)} draft fields, order preserved")
+
+
+def test_draft_body_is_not_read_when_preview_not_requested():
+    """The point of field selection here: Body crosses COM in full."""
+    from outlook_desktop_mcp.utils.formatting import format_draft_summary
+    reads = []
+    out = format_draft_summary(FakeDraft(reads), fields=("subject", "to"))
+    assert "Body" not in reads, reads
+    assert set(out) == {"subject", "to"}, out
+    log("  Body untouched unless body_preview is asked for")
+
+
+def test_draft_preview_is_truncated_with_ellipsis():
+    from outlook_desktop_mcp.utils.formatting import format_draft_summary
+    out = format_draft_summary(FakeDraft([]), fields=("body_preview",))
+    assert out["body_preview"].endswith("..."), out
+    assert len(out["body_preview"]) == 203, len(out["body_preview"])
+    log("  long body previews at 200 chars + ellipsis")
+
+
+def test_draft_fields_reject_email_only_names():
+    """Drafts have no sender and no received_time — asking must fail loudly."""
+    from outlook_desktop_mcp.utils.formatting import DRAFT_SUMMARY_FIELDS, parse_summary_fields
+    fields, err = parse_summary_fields("subject,received_time", DRAFT_SUMMARY_FIELDS)
+    assert fields is None and err and "received_time" in err, (fields, err)
+    log(f"  rejected: {err[:60]}...")
+
+
+def test_envelope_keys_on_drafts_and_pages_by_last_modified():
+    from outlook_desktop_mcp.server import _summary_envelope
+    rows = [{"subject": "a", "last_modified": "2026-09-14 09:15:00"}]
+    env = _summary_envelope(rows, total=5, key="drafts", cursor_field="last_modified")
+    assert "drafts" in env and "emails" not in env, env
+    assert env["truncated"] is True and env["oldest_returned"] == "2026-09-14 09:15:00", env
+    log("  drafts envelope carries its own key and cursor")
+
+
 def main():
     tests = [
         ("No hardcoded US date format", test_no_hardcoded_us_date_format_in_filters),
         ("Restrict date order survives ambiguity", test_restrict_date_order_survives_ambiguity),
+        ("Draft default returns all fields", test_draft_default_returns_all_fields),
+        ("Draft body not read unless asked", test_draft_body_is_not_read_when_preview_not_requested),
+        ("Draft preview truncates", test_draft_preview_is_truncated_with_ellipsis),
+        ("Draft fields reject email-only names", test_draft_fields_reject_email_only_names),
+        ("Drafts envelope key and cursor", test_envelope_keys_on_drafts_and_pages_by_last_modified),
         ("Default returns all fields", test_default_returns_all_fields),
         ("Subset selects and orders", test_subset_selects_and_orders),
         ("Unrequested fields are not read", test_unrequested_fields_are_not_read),

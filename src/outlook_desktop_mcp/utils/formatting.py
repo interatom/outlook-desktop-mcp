@@ -75,25 +75,86 @@ def format_email_summary(item, fields=None) -> dict:
     return {k: out[k] for k in EMAIL_SUMMARY_FIELDS if k in out}
 
 
-def parse_summary_fields(spec: str):
+def parse_summary_fields(spec: str, valid=EMAIL_SUMMARY_FIELDS):
     """Turn a comma-separated field spec into a validated tuple.
 
     Returns (fields, error). An empty spec yields (None, None), i.e. all
     fields. An unknown name is a hard error rather than a silent drop, so a
     typo cannot quietly remove data the caller expected.
+
+    `valid` selects the vocabulary: mail summaries by default, or
+    DRAFT_SUMMARY_FIELDS for the Drafts listing, which has its own columns.
     """
     if not spec or not spec.strip():
         return None, None
     names = [p.strip() for p in spec.split(",") if p.strip()]
     if not names:
         return None, None
-    unknown = [n for n in names if n not in EMAIL_SUMMARY_FIELDS]
+    unknown = [n for n in names if n not in valid]
     if unknown:
         return None, (
             f"Unknown field(s): {', '.join(unknown)}. "
-            f"Valid: {', '.join(EMAIL_SUMMARY_FIELDS)}"
+            f"Valid: {', '.join(valid)}"
         )
     return tuple(dict.fromkeys(names)), None
+
+
+# Drafts list from their own columns: there is no sender (it is you) and no
+# ReceivedTime (an unsent item was never received), while the recipients and a
+# body preview are what a caller needs in order to pick one.
+DRAFT_SUMMARY_FIELDS = (
+    "entry_id",
+    "subject",
+    "to",
+    "cc",
+    "bcc",
+    "last_modified",
+    "has_attachments",
+    "attachment_count",
+    "body_preview",
+)
+
+DRAFT_BODY_PREVIEW_CHARS = 200
+
+
+def format_draft_summary(item, fields=None) -> dict:
+    """Extract key fields from a draft MailItem into a dict.
+
+    Same lazy-read contract as format_email_summary: a field that was not
+    requested is never read. That matters most for body_preview, which pulls
+    the entire message body across the COM boundary just to keep its first
+    200 characters.
+    """
+    wanted = DRAFT_SUMMARY_FIELDS if fields is None else frozenset(fields)
+    out = {}
+
+    if "entry_id" in wanted:
+        out["entry_id"] = item.EntryID
+    if "subject" in wanted:
+        out["subject"] = item.Subject or "(no subject)"
+    if "to" in wanted:
+        out["to"] = item.To or ""
+    if "cc" in wanted:
+        out["cc"] = item.CC or ""
+    if "bcc" in wanted:
+        out["bcc"] = item.BCC or ""
+    if "last_modified" in wanted:
+        out["last_modified"] = str(item.LastModificationTime)
+    if "has_attachments" in wanted or "attachment_count" in wanted:
+        n = item.Attachments.Count
+        if "has_attachments" in wanted:
+            out["has_attachments"] = bool(n > 0)
+        if "attachment_count" in wanted:
+            out["attachment_count"] = n
+    if "body_preview" in wanted:
+        body = item.Body or ""
+        preview = body[:DRAFT_BODY_PREVIEW_CHARS]
+        if len(body) > DRAFT_BODY_PREVIEW_CHARS:
+            preview += "..."
+        out["body_preview"] = preview
+
+    # Keep the declared order regardless of the order the caller asked in.
+    return {k: out[k] for k in DRAFT_SUMMARY_FIELDS if k in out}
 
 
 def format_email_full(item, body_max_length: int = 5000) -> dict:

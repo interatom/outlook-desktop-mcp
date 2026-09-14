@@ -44,6 +44,8 @@ from outlook_desktop_mcp.tools._folder_constants import (
     OL_FLAG_MARKED,
 )
 from outlook_desktop_mcp.utils.formatting import (
+    DRAFT_SUMMARY_FIELDS,
+    format_draft_summary,
     format_email_summary,
     format_email_full,
     format_event_summary,
@@ -72,20 +74,24 @@ logger = logging.getLogger("outlook_desktop_mcp")
 
 # --- Response helpers ---
 
-def _summary_envelope(results, total):
-    """Wrap email summaries with completeness metadata.
+def _summary_envelope(results, total, *, key="emails", cursor_field="received_time"):
+    """Wrap item summaries with completeness metadata.
 
     A clamped or count-limited listing is otherwise indistinguishable from a
     complete one: the caller sees N items and nothing else. "truncated" plus
     "oldest_returned" make the cut-off visible and give the caller the exact
     cursor to page backwards with (pass it as end_date).
+
+    `key` and `cursor_field` exist for listings whose items are not received
+    mail — the Drafts listing keys on "drafts" and pages by last_modified,
+    because an unsent item has no ReceivedTime.
     """
     return {
-        "emails": results,
+        key: results,
         "returned": len(results),
         "total_matching": total,
         "truncated": total > len(results),
-        "oldest_returned": results[-1].get("received_time", "") if results else "",
+        "oldest_returned": results[-1].get(cursor_field, "") if results else "",
     }
 
 
@@ -437,14 +443,13 @@ async def list_drafts(
     limit: int = 50,
     offset: int = 0,
     account: str = "",
+    fields: str = "",
 ) -> str:
     """List drafts currently saved in Outlook's Drafts folder.
 
-    Returns a JSON array of draft summaries sorted by last-modified time
-    (newest first). Each summary includes entry_id, subject, to, cc, bcc,
-    last_modified, has_attachments, and a short body_preview (first ~200
-    chars of the plain-text body). Use entry_id with read_draft to load the
-    full body or with send_draft to dispatch the message.
+    Returns the same envelope shape as list_emails, keyed on "drafts", sorted
+    by last-modified time (newest first). Use entry_id with read_draft to load
+    the full body, or with send_draft to dispatch the message.
 
     Args:
         limit: Maximum number of drafts to return. Default 50, capped at 200.
@@ -452,13 +457,28 @@ async def list_drafts(
             Useful for pagination. Default 0.
         account: Optional. Account display name (or substring) to target.
             Default: primary account. Use list_accounts to see available accounts.
+        fields: Optional comma-separated subset of summary fields, as in
+            list_emails. Default: all fields. Omitted fields are never read
+            from Outlook, which matters most for body_preview — it pulls the
+            whole body across COM to keep 200 characters. An unknown name is
+            rejected rather than silently dropped. Valid: entry_id, subject,
+            to, cc, bcc, last_modified, has_attachments, attachment_count,
+            body_preview.
 
     Returns:
-        JSON array of draft summary objects.
+        JSON object with:
+          drafts          - array of draft summary objects
+          returned        - number of summaries in "drafts"
+          total_matching  - how many drafts the folder holds
+          truncated       - True when the folder holds more than was returned
+          oldest_returned - last_modified of the last summary, the paging cursor
     """
-    def _list(outlook, namespace, limit, offset, account):
+    def _list(outlook, namespace, limit, offset, account, fields):
         limit = min(max(1, limit), 200)
         offset = max(0, offset)
+        selected, field_error = parse_summary_fields(fields, DRAFT_SUMMARY_FIELDS)
+        if field_error:
+            return json.dumps({"error": field_error})
         store = _require_store(namespace, account)
         drafts = store.GetDefaultFolder(16)  # olFolderDrafts
 
@@ -478,28 +498,17 @@ async def list_drafts(
         end = min(offset + limit, total)
         for i in range(start, end + 1):
             try:
-                item = items.Item(i)
-                body = item.Body or ""
-                preview = body[:200]
-                if len(body) > 200:
-                    preview += "..."
-                results.append({
-                    "entry_id": item.EntryID,
-                    "subject": item.Subject or "(no subject)",
-                    "to": item.To or "",
-                    "cc": item.CC or "",
-                    "bcc": item.BCC or "",
-                    "last_modified": str(item.LastModificationTime),
-                    "has_attachments": bool(item.Attachments.Count > 0),
-                    "attachment_count": item.Attachments.Count,
-                    "body_preview": preview,
-                })
+                results.append(format_draft_summary(items.Item(i), selected))
             except Exception:
                 continue
-        return json.dumps(results, indent=2, default=str)
+        return json.dumps(
+            _summary_envelope(results, total, key="drafts", cursor_field="last_modified"),
+            indent=2,
+            default=str,
+        )
 
     try:
-        return await bridge.call(_list, limit, offset, account)
+        return await bridge.call(_list, limit, offset, account, fields)
     except Exception as e:
         return f"Error listing drafts: {format_com_error(e)}"
 
