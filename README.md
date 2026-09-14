@@ -164,6 +164,7 @@ These tools rely on COM-specific APIs (MAPI property accessors, the Rules object
 | `create_category` | yes | — | Add a color category to the master list |
 | `rename_category` | yes | — | Rename a master-list entry (does NOT retag existing items) |
 | `delete_category` | yes | — | Remove a master-list entry (items keep the name, lose the color) |
+| `set_category_color` | yes | — | Change an existing category's color in place |
 | `list_rules` | yes | — | List all mail rules with enabled/disabled status |
 | `toggle_rule` | yes | — | Enable or disable a mail rule by name |
 | `get_out_of_office` | yes | — | Check whether Out of Office auto-reply is on or off |

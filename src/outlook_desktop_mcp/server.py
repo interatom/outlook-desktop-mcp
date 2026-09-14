@@ -197,7 +197,7 @@ mcp = FastMCP(
         "respond to invites, search events\n"
         "- Tasks: create, list, complete, update, delete to-do items\n"
         "- Categories: set/add/remove them on any item, and manage the master\n"
-        "  list itself (list, create, rename, delete)\n"
+        "  list itself (list, create, rename, recolor, delete)\n"
         "- Rules: list and manage mail rules\n"
         "- Out of Office: check auto-reply status\n"
         "- Folders: list folder hierarchy with item counts"
@@ -2307,6 +2307,53 @@ async def delete_category(name: str, account: str = "") -> str:
         return await bridge.call(_delete, name, account)
     except Exception as e:
         return f"Error deleting category: {format_com_error(e)}"
+
+
+@mcp.tool()
+async def set_category_color(name: str, color: str, account: str = "") -> str:
+    """Change the color of an existing category.
+
+    Measured 2026-09-14: Category.Color is writable in place and the new value
+    survives a fresh MAPI namespace, so this needs no delete-and-recreate.
+    Items follow immediately -- they bind to the category by NAME, and the
+    color lives only on the list entry.
+
+    Args:
+        name: Category name (case-insensitive match).
+        color: Friendly color name -- see create_category for the palette,
+            or "none" to strip the color.
+        account: Optional. Accepted for consistency but NOT honored.
+
+    Returns:
+        Confirmation with the old and new color, or an error.
+    """
+    name = (name or "").strip()
+    if not name:
+        return "Error: name must not be empty."
+
+    key = (color or "").strip().lower().replace(" ", "_").replace("-", "_")
+    if key not in CATEGORY_COLOR_FROM_NAME:
+        valid = ", ".join(sorted(CATEGORY_COLOR_FROM_NAME))
+        return f"Error: invalid color '{color}'. Valid: {valid}."
+    color_index = CATEGORY_COLOR_FROM_NAME[key]
+
+    def _recolor(outlook, namespace, name, color_index, account):
+        idx, cat = _find_category(namespace, name)
+        if cat is None:
+            return f"Error: no category named '{name}'."
+        actual = cat.Name
+        was = CATEGORY_COLOR_NAMES.get(cat.Color, "unknown")
+        cat.Color = color_index
+        _, again = _find_category(namespace, actual)
+        now = CATEGORY_COLOR_NAMES.get(again.Color, "unknown") if again else "unknown"
+        if again is None or again.Color != color_index:
+            return f"Error: color of '{actual}' did not change (still {now})."
+        return f"Category '{actual}' recolored: {was} -> {now}"
+
+    try:
+        return await bridge.call(_recolor, name, color_index, account)
+    except Exception as e:
+        return f"Error recoloring category: {format_com_error(e)}"
 
 
 # =====================================================================

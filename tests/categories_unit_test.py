@@ -428,6 +428,37 @@ def test_color_map_is_contiguous_and_reversible():
     log("  26 colors, 0..25 contiguous, name<->index reversible")
 
 
+def test_set_category_color_changes_it_in_place():
+    """Measured: Color is writable, so no delete-and-recreate is needed."""
+    cats = FakeCategories(["Internal", "Absence"])
+    cats.Item(2).Color = 13                       # gray
+    out = call_cat_tool(
+        "set_category_color", {"name": "absence", "color": "black"}, cats
+    )
+    assert cats.Item(2).Color == 15, cats.Item(2).Color
+    assert cats.names() == ["Internal", "Absence"], cats.names()
+    assert "gray" in out and "black" in out, out
+    log(f"  recolored in place, name and position unchanged: {out}")
+
+
+def test_set_category_color_rejects_an_unknown_color():
+    cats = FakeCategories(["Internal"])
+    before = cats.Item(1).Color
+    out = call_cat_tool(
+        "set_category_color", {"name": "Internal", "color": "chartreuse"}, cats
+    )
+    assert cats.Item(1).Color == before, cats.Item(1).Color
+    assert "chartreuse" in out, out
+    log("  invalid color leaves the entry untouched")
+
+
+def test_set_category_color_reports_a_missing_name():
+    cats = FakeCategories(["Internal"])
+    out = call_cat_tool("set_category_color", {"name": "Nope", "color": "red"}, cats)
+    assert "no category named" in out, out
+    log("  missing name reported plainly")
+
+
 def main():
     tests = [
         ("Split trims and drops empties", test_split_trims_and_drops_empties),
@@ -457,6 +488,9 @@ def main():
         ("Delete removes by name", test_delete_category_removes_by_name),
         ("Delete reports missing name", test_delete_category_reports_a_missing_name),
         ("Color map contiguous/reversible", test_color_map_is_contiguous_and_reversible),
+        ("Recolor in place", test_set_category_color_changes_it_in_place),
+        ("Recolor rejects unknown color", test_set_category_color_rejects_an_unknown_color),
+        ("Recolor reports missing name", test_set_category_color_reports_a_missing_name),
     ]
     failed = 0
     for name, fn in tests:
